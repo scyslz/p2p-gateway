@@ -217,28 +217,14 @@ func resolveTarget(r *http.Request) string {
 		log.Printf("[signal] host p2p routing: %s → %s", host, target)
 		return target
 	}
-	// 4. No prefix, no base_domain match — use the host directly
-	//    (works for IPs like 192.168.1.100 or any domain)
-	if gatewayCfg.BaseDomain == "" || strings.HasSuffix(host, "."+gatewayCfg.BaseDomain) || host == gatewayCfg.BaseDomain {
-		scheme := gatewayCfg.Scheme
-		if scheme == "" {
-			scheme = "http"
-		}
-		target := scheme + "://" + host
-		log.Printf("[signal] host direct: %s → %s", host, target)
-		return target
+	// 4. No prefix — use the host directly as the upstream domain.
+	//    Works for IPs (192.168.x.x), any domain, or localhost.
+	scheme := gatewayCfg.Scheme
+	if scheme == "" {
+		scheme = "http"
 	}
-	// 5. Last resort: try host-based routing via resolver
-	target, err := routing.NewResolver(routing.Config{
-		BaseDomain: gatewayCfg.BaseDomain,
-		Prefix:     gatewayCfg.Prefix,
-		Scheme:     gatewayCfg.Scheme,
-	}).TargetWithPort(host, gatewayCfg.UpstreamPort)
-	if err != nil {
-		// Give up — return empty so peer has no target
-		log.Printf("[signal] no target resolved for host %q: %v", host, err)
-		return ""
-	}
+	target := scheme + "://" + host
+	log.Printf("[signal] host direct: %s → %s", host, target)
 	return target
 }
 
