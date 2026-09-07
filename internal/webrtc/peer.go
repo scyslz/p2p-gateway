@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -37,10 +38,8 @@ type Peer struct {
 	wsStreams map[string]*websocket.Conn
 }
 
-// SetTarget records the upstream URL on the peer.
 func (p *Peer) SetTarget(t string) { p.target = t }
 
-// Target returns the upstream URL.
 func (p *Peer) Target() (string, error) {
 	if p.target == "" {
 		return "", fmt.Errorf("no target configured")
@@ -48,14 +47,12 @@ func (p *Peer) Target() (string, error) {
 	return p.target, nil
 }
 
-// RequestHandler is invoked for every HTTP request received over the
-// DataChannel.  Implementations should write a JSON response back to
-// the channel.
 type RequestHandler func(p *Peer, req []byte) ([]byte, error)
 
 // Config for creating PeerConnections.
 type Config struct {
-	STUNURL string
+	STUNURL string // comma-separated STUN URLs
+	TURNURL string // optional TURN URL
 }
 
 // Manager owns the API.
@@ -68,13 +65,11 @@ type Manager struct {
 	peers map[string]*Peer
 }
 
-// NewManager builds a webrtc Manager.
 func NewManager(cfg Config, handler RequestHandler) (*Manager, error) {
 	api := webrtc.NewAPI()
 	return &Manager{api: api, cfg: cfg, handler: handler, peers: make(map[string]*Peer)}, nil
 }
 
-// Peer returns the active peer with the given signaling ID, or nil.
 func (m *Manager) Peer(id string) *Peer {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -93,12 +88,70 @@ func (m *Manager) removePeer(id string) {
 	m.mu.Unlock()
 }
 
-// HandleSignalingPeer attaches to a new signaling peer and waits for an offer.
+// buildICEServers parses the comma-separated STUN URLs and optional TURN URL
+// into []webrtc.ICEServer for the peer connection.
+func (m *Manager) buildICEServers() []webrtc.ICEServer {
+	var servers []webrtc.ICEServer
+
+	// STUN servers (comma-separated)
+	if m.cfg.STUNURL != "" {
+		for _, s := range strings.Split(m.cfg.STUNURL, ",") {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				servers = append(servers, webrtc.ICEServer{
+					URLs: []string{s},
+				})
+			}
+		}
+	}
+
+	// Optional TURN server
+	if m.cfg.TURNURL != "" {
+		for _, s := range strings.Split(m.cfg.TURNURL, ",") {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			ices := webrtc.ICEServer{
+				URLs: []string{s},
+			}
+			// Parse turn:user:pass@host format
+			if strings.HasPrefix(s, "turn:") || strings.HasPrefix(s, "turns:") {
+				// Extract credentials from URL if present
+				// Format: turn:user:password@host:port
+				atIdx := strings.LastIndex(s, "@")
+				if atIdx > 0 {
+					beforeAt := s[:atIdx]
+					// turn:user:pass → username=user, credential=pass
+					idx := strings.Index(beforeAt, "://")
+					if idx >= 0 {
+						cred := beforeAt[idx+3:]
+						colonIdx := strings.Index(cred, ":")
+						if colonIdx >= 0 {
+							ices.Username = cred[:colonIdx]
+							ices.Credential = cred[colonIdx+1:]
+							ices.URLs = []string{s}
+						}
+					}
+				}
+			}
+			servers = append(servers, ices)
+		}
+	}
+
+	if len(servers) == 0 {
+		servers = []webrtc.ICEServer{
+			{URLs: []string{"stun:stun.l.google.com:19302"}},
+		}
+	}
+
+	log.Printf("[webrtc] ICE servers: %v", servers)
+	return servers
+}
+
 func (m *Manager) HandleSignalingPeer(sp *signaling.Peer) error {
 	pc, err := m.api.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{URLs: []string{m.cfg.STUNURL}},
-		},
+		ICEServers: m.buildICEServers(),
 	})
 	if err != nil {
 		return fmt.Errorf("new peer connection: %w", err)
@@ -247,7 +300,6 @@ func (p *Peer) Close() {
 	sig := p.signaling
 	p.mu.Unlock()
 
-	// Close all WebSocket streams
 	p.closeAllWSStreams()
 
 	if pc != nil {
@@ -260,7 +312,6 @@ func (p *Peer) Close() {
 
 func (p *Peer) DataChannel() *webrtc.DataChannel { return p.dc }
 
-// SendDC sends a message through the DataChannel if it's open.
 func (p *Peer) SendDC(data []byte) {
 	p.mu.Lock()
 	dc := p.dc
@@ -272,14 +323,12 @@ func (p *Peer) SendDC(data []byte) {
 
 // --- WebSocket stream multiplexing ---
 
-// RegisterWSStream registers an upstream WebSocket connection for a given stream ID.
 func (p *Peer) RegisterWSStream(id string, conn *websocket.Conn) {
 	p.wsMu.Lock()
 	p.wsStreams[id] = conn
 	p.wsMu.Unlock()
 }
 
-// UnregisterWSStream removes and closes a WebSocket stream.
 func (p *Peer) UnregisterWSStream(id string) {
 	p.wsMu.Lock()
 	if c, ok := p.wsStreams[id]; ok {
@@ -291,7 +340,6 @@ func (p *Peer) UnregisterWSStream(id string) {
 	p.wsMu.Unlock()
 }
 
-// RouteWSData forwards base64 data from the DataChannel to the upstream WS.
 func (p *Peer) RouteWSData(id, dataB64 string, binary bool) {
 	p.wsMu.Lock()
 	conn, ok := p.wsStreams[id]
@@ -299,7 +347,7 @@ func (p *Peer) RouteWSData(id, dataB64 string, binary bool) {
 	if !ok {
 		return
 	}
-	data, err := base64Decode(dataB64)
+	data, err := base64.StdEncoding.DecodeString(dataB64)
 	if err != nil {
 		return
 	}
@@ -310,7 +358,6 @@ func (p *Peer) RouteWSData(id, dataB64 string, binary bool) {
 	conn.WriteMessage(mt, data)
 }
 
-// CloseWSStream sends a close frame to the upstream WS and removes it.
 func (p *Peer) CloseWSStream(id string, code int, reason string) {
 	p.wsMu.Lock()
 	conn, ok := p.wsStreams[id]
@@ -335,8 +382,4 @@ func (p *Peer) closeAllWSStreams() {
 	for _, c := range streams {
 		c.Close()
 	}
-}
-
-func base64Decode(s string) ([]byte, error) {
-	return base64.StdEncoding.DecodeString(s)
 }

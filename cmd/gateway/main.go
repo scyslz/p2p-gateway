@@ -61,10 +61,11 @@ type Config struct {
 	TLSKey       string `yaml:"tls_key"`
 	BaseDomain   string `yaml:"base_domain"`
 	Prefix       string `yaml:"prefix"`
-	STUNURL      string `yaml:"stun_url"`
+	STUNURL      string `yaml:"stun_url"`   // comma-separated list
+	TURNURL      string `yaml:"turn_url"`   // optional: turn:user:pass@host:port?transport=udp
 	Scheme       string `yaml:"scheme"`
 	UpstreamPort int    `yaml:"upstream_port"`
-	Target       string `yaml:"target"` // fixed upstream target; overrides host routing
+	Target       string `yaml:"target"`
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -119,7 +120,7 @@ func main() {
 	})
 
 	hub := signaling.NewHub()
-	mgr, err := wrtc.NewManager(wrtc.Config{STUNURL: cfg.STUNURL}, proxyFactory(resolver))
+	mgr, err := wrtc.NewManager(wrtc.Config{STUNURL: cfg.STUNURL, TURNURL: cfg.TURNURL}, proxyFactory(resolver))
 	if err != nil {
 		log.Fatalf("init webrtc manager: %v", err)
 	}
