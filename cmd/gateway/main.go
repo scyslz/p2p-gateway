@@ -186,9 +186,9 @@ func main() {
 }
 
 // resolveTarget picks the upstream for a signaling peer.
-// Priority: ?target= query param > global config Target > host-based routing.
+// Priority: ?target= query param > global config Target > host direct > host p2p-prefix routing.
 func resolveTarget(r *http.Request) string {
-	// 1. Query param
+	// 1. Query param — highest priority, use as-is
 	if t := r.URL.Query().Get("target"); t != "" {
 		if !strings.Contains(t, "://") {
 			t = "http://" + t
@@ -200,18 +200,43 @@ func resolveTarget(r *http.Request) string {
 	if gatewayCfg.Target != "" {
 		return gatewayCfg.Target
 	}
-	// 3. Host-based routing (original behavior)
+	// 3. Derive target from Host header
 	host := r.Host
 	if i := strings.IndexByte(host, ':'); i >= 0 {
 		host = host[:i]
 	}
+	// Strip p2p- prefix if present → use the rest as upstream domain
+	stripped := strings.TrimPrefix(host, gatewayCfg.Prefix)
+	if stripped != host && stripped != "" {
+		// Had the prefix → route to the stripped domain
+		scheme := gatewayCfg.Scheme
+		if scheme == "" {
+			scheme = "http"
+		}
+		target := scheme + "://" + stripped
+		log.Printf("[signal] host p2p routing: %s → %s", host, target)
+		return target
+	}
+	// 4. No prefix, no base_domain match — use the host directly
+	//    (works for IPs like 192.168.1.100 or any domain)
+	if gatewayCfg.BaseDomain == "" || strings.HasSuffix(host, "."+gatewayCfg.BaseDomain) || host == gatewayCfg.BaseDomain {
+		scheme := gatewayCfg.Scheme
+		if scheme == "" {
+			scheme = "http"
+		}
+		target := scheme + "://" + host
+		log.Printf("[signal] host direct: %s → %s", host, target)
+		return target
+	}
+	// 5. Last resort: try host-based routing via resolver
 	target, err := routing.NewResolver(routing.Config{
 		BaseDomain: gatewayCfg.BaseDomain,
 		Prefix:     gatewayCfg.Prefix,
 		Scheme:     gatewayCfg.Scheme,
 	}).TargetWithPort(host, gatewayCfg.UpstreamPort)
 	if err != nil {
-		log.Printf("[signal] host routing failed: %v", err)
+		// Give up — return empty so peer has no target
+		log.Printf("[signal] no target resolved for host %q: %v", host, err)
 		return ""
 	}
 	return target
@@ -228,9 +253,10 @@ func proxyFactory(resolver *routing.Resolver) wrtc.RequestHandler {
 }
 
 func handleDirect(resolver *routing.Resolver, w http.ResponseWriter, r *http.Request) {
-	target, err := resolver.TargetWithPort(r.Host, gatewayCfg.UpstreamPort)
-	if err != nil {
-		http.Error(w, "bad host: "+err.Error(), http.StatusBadRequest)
+	// Use the same target resolution logic as signaling.
+	target := resolveTarget(r)
+	if target == "" {
+		http.Error(w, "no target resolved", http.StatusBadRequest)
 		return
 	}
 
@@ -352,16 +378,24 @@ func resolveFromHost(host string) (string, error) {
 		}
 		gatewayCfg = cfg
 	}
-	// If global target is set, just return it.
 	if gatewayCfg.Target != "" {
 		return gatewayCfg.Target, nil
 	}
-	r := routing.NewResolver(routing.Config{
-		BaseDomain: gatewayCfg.BaseDomain,
-		Prefix:     gatewayCfg.Prefix,
-		Scheme:     gatewayCfg.Scheme,
-	})
-	return r.TargetWithPort(host, gatewayCfg.UpstreamPort)
+	// Strip p2p- prefix
+	stripped := strings.TrimPrefix(host, gatewayCfg.Prefix)
+	if stripped != host && stripped != "" {
+		scheme := gatewayCfg.Scheme
+		if scheme == "" {
+			scheme = "http"
+		}
+		return scheme + "://" + stripped, nil
+	}
+	// Direct host
+	scheme := gatewayCfg.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+	return scheme + "://" + host, nil
 }
 
 func singleSlash(a, b string) string {
