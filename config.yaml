@@ -1,0 +1,8 @@
+listen_addr: ":8080"
+tls_cert: ""
+tls_key: ""
+base_domain: "localhost"
+prefix: "p2p-"
+stun_url: "stun:stun.l.google.com:19302"
+scheme: "http"
+# target: "http://127.0.0.1:3000"  # uncomment to set a fixed upstream
