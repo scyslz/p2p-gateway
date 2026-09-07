@@ -46,7 +46,7 @@ func TestForward(t *testing.T) {
 		BodyB64: "",
 	}
 	// We don't go through the wrapper - call forward() directly.
-	resp, err := forward(client, upstream.URL, req)
+	resp, err := forwardHTTP(client, upstream.URL, req)
 	if err != nil {
 		t.Fatalf("forward GET /: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestForward(t *testing.T) {
 		Headers: map[string]string{"Content-Type": "text/plain"},
 		BodyB64: base64.StdEncoding.EncodeToString(postBody),
 	}
-	resp2, err := forward(client, upstream.URL, req2)
+	resp2, err := forwardHTTP(client, upstream.URL, req2)
 	if err != nil {
 		t.Fatalf("forward POST: %v", err)
 	}
@@ -117,5 +117,169 @@ func TestHandlerJSONShape(t *testing.T) {
 		if len(b) != 0 {
 			t.Errorf("expected empty body, got %q", string(b))
 		}
+	}
+}
+func TestRedirectFollow(t *testing.T) {
+	// Test: 302 redirect within same origin is followed automatically.
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login":
+			http.Redirect(w, r, "/dashboard", http.StatusFound)
+		case "/dashboard":
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, "welcome")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	SetTestClient(upstream.Client())
+	defer SetTestClient(nil)
+
+	h := Handler(upstream.URL)
+	rawReq, _ := json.Marshal(Request{
+		Type: "request", ID: "r1", Method: "GET",
+		Path: "/login", Headers: map[string]string{},
+	})
+	out, err := h(nil, rawReq)
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	var resp Response
+	_ = json.Unmarshal(out, &resp)
+	if resp.Status != 200 {
+		t.Errorf("expected 200 after redirect, got %d", resp.Status)
+	}
+	body, _ := base64.StdEncoding.DecodeString(resp.BodyB64)
+	if string(body) != "welcome" {
+		t.Errorf("body = %q, want %q", string(body), "welcome")
+	}
+}
+
+func TestRedirectCrossOriginBlocked(t *testing.T) {
+	// Test: redirect to different origin is blocked.
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://evil.com/steal", http.StatusFound)
+	}))
+	defer upstream.Close()
+
+	SetTestClient(upstream.Client())
+	defer SetTestClient(nil)
+
+	h := Handler(upstream.URL)
+	rawReq, _ := json.Marshal(Request{
+		Type: "request", ID: "r2", Method: "GET",
+		Path: "/redirect", Headers: map[string]string{},
+	})
+	out, err := h(nil, rawReq)
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	var resp Response
+	_ = json.Unmarshal(out, &resp)
+	if resp.Status != 502 {
+		t.Errorf("expected 502 for cross-origin redirect, got %d", resp.Status)
+	}
+}
+
+func TestRedirectHTTPDowngradeBlocked(t *testing.T) {
+	// Test: HTTPS → HTTP redirect is blocked.
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://example.com/login", http.StatusFound)
+	}))
+	defer upstream.Close()
+
+	SetTestClient(upstream.Client())
+	defer SetTestClient(nil)
+
+	h := Handler(upstream.URL)
+	rawReq, _ := json.Marshal(Request{
+		Type: "request", ID: "r3", Method: "GET",
+		Path: "/downgrade", Headers: map[string]string{},
+	})
+	out, err := h(nil, rawReq)
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	var resp Response
+	_ = json.Unmarshal(out, &resp)
+	if resp.Status != 502 {
+		t.Errorf("expected 502 for HTTP downgrade redirect, got %d", resp.Status)
+	}
+}
+
+func TestRedirectLoopBlocked(t *testing.T) {
+	// Test: redirect loop triggers max redirect limit.
+	loopCount := 0
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		loopCount++
+		if r.URL.Path == "/a" {
+			http.Redirect(w, r, "/b", http.StatusFound)
+		} else {
+			http.Redirect(w, r, "/a", http.StatusFound)
+		}
+	}))
+	defer upstream.Close()
+
+	SetTestClient(upstream.Client())
+	defer SetTestClient(nil)
+
+	h := Handler(upstream.URL)
+	rawReq, _ := json.Marshal(Request{
+		Type: "request", ID: "r4", Method: "GET",
+		Path: "/a", Headers: map[string]string{},
+	})
+	out, err := h(nil, rawReq)
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	var resp Response
+	_ = json.Unmarshal(out, &resp)
+	// Should fail with 502 after maxRedirects (10) iterations.
+	if resp.Status != 502 {
+		t.Errorf("expected 502 for redirect loop, got %d", resp.Status)
+	}
+	if loopCount > 11 {
+		t.Errorf("too many redirects: %d", loopCount)
+	}
+}
+
+func TestRedirectPostPreserved307(t *testing.T) {
+	// Test: 307 preserves POST method.
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/test" && r.Method == "POST" {
+			http.Redirect(w, r, "/result", http.StatusTemporaryRedirect)
+		} else if r.URL.Path == "/result" && r.Method == "POST" {
+			b, _ := io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write(b)
+		} else {
+			w.WriteHeader(405)
+		}
+	}))
+	defer upstream.Close()
+
+	SetTestClient(upstream.Client())
+	defer SetTestClient(nil)
+
+	h := Handler(upstream.URL)
+	rawReq, _ := json.Marshal(Request{
+		Type: "request", ID: "r5", Method: "POST",
+		Path: "/test", Headers: map[string]string{"Content-Type": "text/plain"},
+		BodyB64: base64.StdEncoding.EncodeToString([]byte("data")),
+	})
+	out, err := h(nil, rawReq)
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	var resp Response
+	_ = json.Unmarshal(out, &resp)
+	if resp.Status != 200 {
+		t.Errorf("expected 200, got %d", resp.Status)
+	}
+	body, _ := base64.StdEncoding.DecodeString(resp.BodyB64)
+	if string(body) != "data" {
+		t.Errorf("body = %q, want %q", string(body), "data")
 	}
 }

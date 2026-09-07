@@ -15,27 +15,17 @@ import (
 )
 
 type Peer struct {
-	signaling *signaling.Peer
-	pc        *webrtc.PeerConnection
-	dc        *webrtc.DataChannel
-	inbox     chan []byte
-	target    string
-	mu        sync.Mutex
-	closed    bool
-	onReq     RequestHandler
-	wsMu      sync.Mutex
-	wsStreams map[string]*websocket.Conn
+	signaling  *signaling.Peer
+	pc         *webrtc.PeerConnection
+	dc         *webrtc.DataChannel
+	onReq      RequestHandler
+	inbox      chan []byte
+	wsStreams  map[string]*websocket.Conn
+	mu         sync.Mutex
+	closed     bool
+	target     string
 }
-
-func (p *Peer) SetTarget(t string) { p.target = t }
-func (p *Peer) Target() (string, error) {
-	if p.target == "" {
-		return "", fmt.Errorf("no target configured")
-	}
-	return p.target, nil
-}
-
-type RequestHandler func(p *Peer, req []byte) ([]byte, error)
+type RequestHandler func(p *Peer, raw []byte) ([]byte, error)
 
 type Config struct {
 	STUNURL string
@@ -46,96 +36,28 @@ type Manager struct {
 	api     *webrtc.API
 	cfg     Config
 	handler RequestHandler
-	mu      sync.Mutex
-	peers   map[string]*Peer
+
+	mu    sync.Mutex
+	peers map[string]*Peer
 }
 
 func NewManager(cfg Config, handler RequestHandler) (*Manager, error) {
-	api := webrtc.NewAPI()
-	return &Manager{api: api, cfg: cfg, handler: handler, peers: make(map[string]*Peer)}, nil
-}
+	m := &Manager{cfg: cfg, handler: handler, peers: make(map[string]*Peer)}
 
-func (m *Manager) Peer(id string) *Peer {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.peers[id]
-}
-
-func (m *Manager) addPeer(p *Peer) {
-	m.mu.Lock()
-	m.peers[p.signaling.ID] = p
-	m.mu.Unlock()
-}
-
-func (m *Manager) removePeer(id string) {
-	m.mu.Lock()
-	delete(m.peers, id)
-	m.mu.Unlock()
-}
-
-// parseICEServers parses comma-separated STUN URLs and optional TURN URLs
-// into []webrtc.ICEServer. TURN URLs in turn:user:pass@host:port format
-// are parsed and credentials are set separately.
-func parseICEServers(stunCSV, turnCSV string) []webrtc.ICEServer {
-	var servers []webrtc.ICEServer
-
-	// STUN servers — just pass through
-	for _, s := range strings.Split(stunCSV, ",") {
-		s = strings.TrimSpace(s)
-		if s != "" {
-			servers = append(servers, webrtc.ICEServer{URLs: []string{s}})
-		}
+	// Set up MediaEngine and SettingEngine
+	mediaEngine := &webrtc.MediaEngine{}
+	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
+		return nil, fmt.Errorf("register codecs: %w", err)
 	}
 
-	// TURN servers — parse credentials from URL
-	for _, s := range strings.Split(turnCSV, ",") {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
-		}
+	var settingEngine webrtc.SettingEngine
+	m.api = webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine), webrtc.WithSettingEngine(settingEngine))
 
-		ices := webrtc.ICEServer{}
-		isTurn := strings.HasPrefix(s, "turn:") || strings.HasPrefix(s, "turns:")
-
-		if isTurn {
-			prefix := "turn:"
-			if strings.HasPrefix(s, "turns:") {
-				prefix = "turns:"
-			}
-			// s = turn:user:pass@host:port?transport=udp
-			rest := s[len(prefix):] // user:pass@host:port?transport=udp
-			atIdx := strings.LastIndex(rest, "@")
-			if atIdx > 0 {
-				credPart := rest[:atIdx] // user:pass
-				hostPart := rest[atIdx+1:] // host:port?transport=udp
-				colonIdx := strings.Index(credPart, ":")
-				if colonIdx > 0 {
-					ices.Username = credPart[:colonIdx]
-					ices.Credential = credPart[colonIdx+1:]
-					// Reconstruct URL without credentials: turn:host:port?transport=udp
-					cleanURL := prefix + hostPart
-					ices.URLs = []string{cleanURL}
-					log.Printf("[webrtc] TURN: user=%q url=%q", ices.Username, cleanURL)
-				}
-			}
-			if ices.Username == "" {
-				// Fallback: use original URL
-				ices.URLs = []string{s}
-			}
-		} else {
-			ices.URLs = []string{s}
-		}
-		servers = append(servers, ices)
-	}
-
-	if len(servers) == 0 {
-		servers = []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
-		}
-	}
-	return servers
+	return m, nil
 }
 
+// HandleSignalingPeer creates a PeerConnection for the connecting browser,
+// then sends an OFFER to it. The browser answers and the DataChannel carries HTTP.
 func (m *Manager) HandleSignalingPeer(sp *signaling.Peer) error {
 	iceServers := parseICEServers(m.cfg.STUNURL, m.cfg.TURNURL)
 	log.Printf("[webrtc] ICE servers: %+v", iceServers)
@@ -155,11 +77,37 @@ func (m *Manager) HandleSignalingPeer(sp *signaling.Peer) error {
 		wsStreams: make(map[string]*websocket.Conn),
 	}
 
+	// Route all WebSocket messages from browser directly to webrtc inbox.
+	sp.OnMessage = func(msg []byte) {
+		select {
+		case p.inbox <- msg:
+		default:
+			log.Printf("[webrtc] webrtc inbox full for peer %s", sp.ID)
+		}
+	}
+
+	// Gateway creates DataChannel (as offerer)
+	dc, err := pc.CreateDataChannel("http", &webrtc.DataChannelInit{Ordered: boolPtr(true)})
+	if err != nil {
+		pc.Close()
+		return fmt.Errorf("create data channel: %w", err)
+	}
+	p.dc = dc
+
+	dc.OnOpen(func() {
+		log.Printf("[webrtc] DataChannel %q opened for peer %s", dc.Label(), sp.ID)
+	})
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		p.handleDCMessage(msg)
+	})
+
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
+			log.Printf("[webrtc] ICE gathering complete for peer %s", sp.ID)
 			return
 		}
 		init := c.ToJSON()
+		log.Printf("[webrtc] local ICE candidate for %s: %s", sp.ID, init.Candidate)
 		msg, _ := json.Marshal(map[string]interface{}{
 			"type":      "candidate",
 			"to":        sp.ID,
@@ -168,52 +116,60 @@ func (m *Manager) HandleSignalingPeer(sp *signaling.Peer) error {
 		select {
 		case sp.Send <- msg:
 		default:
+			log.Printf("[webrtc] signaling Send full, dropping candidate")
 		}
+	})
+
+	pc.OnICEGatheringStateChange(func(s webrtc.ICEGathererState) {
+		log.Printf("[webrtc] ICE gathering state for %s: %s", sp.ID, s)
 	})
 
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		log.Printf("[webrtc] connection state: %s", s)
-		if s == webrtc.PeerConnectionStateFailed ||
-			s == webrtc.PeerConnectionStateClosed ||
-			s == webrtc.PeerConnectionStateDisconnected {
+		log.Printf("[webrtc] connection state for %s: %s", sp.ID, s)
+		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed || s == webrtc.PeerConnectionStateDisconnected {
 			p.Close()
+			m.removePeer(sp.ID)
 		}
 	})
 
-	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		if dc.Label() != "http" {
-			return
-		}
-		p.dc = dc
-		log.Printf("[webrtc] data channel %q opened", dc.Label())
-		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			if !msg.IsString {
-				return
-			}
-			resp, err := p.onReq(p, msg.Data)
-			if err != nil {
-				log.Printf("[webrtc] handler error: %v", err)
-				return
-			}
-			if resp != nil {
-				dc.SendText(string(resp))
-			}
-		})
-		dc.OnClose(func() { log.Printf("[webrtc] data channel closed") })
-	})
+	// Create offer as Gateway (offerer)
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		pc.Close()
+		return fmt.Errorf("create offer: %w", err)
+	}
+	if err := pc.SetLocalDescription(offer); err != nil {
+		pc.Close()
+		return fmt.Errorf("set local description: %w", err)
+	}
 
-	go p.runSignalingLoop(m)
-	m.addPeer(p)
+	// Send offer to browser via signaling
+	out, _ := json.Marshal(map[string]interface{}{
+		"type": "offer", "to": sp.ID, "sdp": offer,
+	})
+	select {
+	case sp.Send <- out:
+		log.Printf("[webrtc] sent offer to browser %s", sp.ID)
+	default:
+		log.Printf("[webrtc] signaling Send full, dropping offer")
+	}
+
+	// Start background signaling loop — reads from signaling inbox
+	// to handle browser's answer and ICE candidates
+	go p.runGatewaySignalingLoop(m)
+
+	m.addPeer(sp.ID, p)
 	return nil
 }
 
-func (p *Peer) runSignalingLoop(m *Manager) {
+func (p *Peer) runGatewaySignalingLoop(m *Manager) {
 	defer func() {
 		if m != nil {
 			m.removePeer(p.signaling.ID)
 		}
 		p.Close()
 	}()
+
 	for raw := range p.inbox {
 		var env struct {
 			Type string          `json:"type"`
@@ -224,29 +180,19 @@ func (p *Peer) runSignalingLoop(m *Manager) {
 			continue
 		}
 		switch env.Type {
-		case "offer":
-			offer := webrtc.SessionDescription{}
-			if err := json.Unmarshal(env.SDP, &offer); err != nil {
+		case "answer":
+			log.Printf("[webrtc] received answer from browser %s", p.signaling.ID)
+			answer := webrtc.SessionDescription{}
+			if err := json.Unmarshal(env.SDP, &answer); err != nil {
+				log.Printf("[webrtc] bad answer SDP: %v", err)
 				continue
 			}
-			if err := p.pc.SetRemoteDescription(offer); err != nil {
+			if err := p.pc.SetRemoteDescription(answer); err != nil {
+				log.Printf("[webrtc] set remote description: %v", err)
 				continue
-			}
-			answer, err := p.pc.CreateAnswer(nil)
-			if err != nil {
-				continue
-			}
-			if err := p.pc.SetLocalDescription(answer); err != nil {
-				continue
-			}
-			out, _ := json.Marshal(map[string]interface{}{
-				"type": "answer", "to": p.signaling.ID, "sdp": answer,
-			})
-			select {
-			case p.signaling.Send <- out:
-			default:
 			}
 		case "candidate":
+			log.Printf("[webrtc] received candidate from browser %s", p.signaling.ID)
 			c := webrtc.ICECandidateInit{}
 			if err := json.Unmarshal(env.Cand, &c); err != nil {
 				continue
@@ -284,67 +230,231 @@ func (p *Peer) SendDC(data []byte) {
 	dc := p.dc
 	p.mu.Unlock()
 	if dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen {
-		dc.SendText(string(data))
+		dc.Send(data)
 	}
 }
 
-func (p *Peer) RegisterWSStream(id string, conn *websocket.Conn) {
-	p.wsMu.Lock()
-	p.wsStreams[id] = conn
-	p.wsMu.Unlock()
-}
-
-func (p *Peer) UnregisterWSStream(id string) {
-	p.wsMu.Lock()
-	if c, ok := p.wsStreams[id]; ok {
-		delete(p.wsStreams, id)
-		p.wsMu.Unlock()
-		c.Close()
+func (p *Peer) handleDCMessage(msg webrtc.DataChannelMessage) {
+	raw := msg.Data
+	var envelope struct {
+		Type    string `json:"type"`
+		StreamID string `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return
 	}
-	p.wsMu.Unlock()
+	switch envelope.Type {
+	case "request":
+		if p.onReq != nil {
+			resp, err := p.onReq(p, raw)
+			if err != nil {
+				log.Printf("[proxy] handler error: %v", err)
+			}
+			if resp != nil {
+				p.SendDC(resp)
+			}
+		}
+	case "ws-open":
+		p.handleWSOpen(raw, envelope.StreamID)
+	case "ws-data":
+		p.handleWSData(raw, envelope.StreamID)
+	case "ws-close":
+		p.handleWSClose(envelope.StreamID)
+	default:
+		if p.onReq != nil {
+			resp, err := p.onReq(p, raw)
+			if err != nil {
+				log.Printf("[proxy] handler error: %v", err)
+			}
+			if resp != nil {
+				p.SendDC(resp)
+			}
+		}
+	}
 }
 
-func (p *Peer) RouteWSData(id, dataB64 string, binary bool) {
-	p.wsMu.Lock()
-	conn, ok := p.wsStreams[id]
-	p.wsMu.Unlock()
-	if !ok {
+func (p *Peer) handleWSOpen(raw []byte, streamID string) {
+	var msg struct {
+		Type   string `json:"type"`
+		StreamID string `json:"id"`
+		Path   string `json:"path"`
+		Host   string `json:"host"`
+		Proto  string `json:"protocols"`
+	}
+	if err := json.Unmarshal(raw, &msg); err != nil {
 		return
 	}
-	data, err := base64.StdEncoding.DecodeString(dataB64)
+	if p.onReq == nil {
+		p.sendWSOpenErr(streamID, "no handler")
+		return
+	}
+	resp, err := p.onReq(p, raw)
 	if err != nil {
+		p.sendWSOpenErr(streamID, err.Error())
 		return
 	}
-	mt := websocket.TextMessage
-	if binary {
-		mt = websocket.BinaryMessage
-	}
-	conn.WriteMessage(mt, data)
+	_ = resp
 }
 
-func (p *Peer) CloseWSStream(id string, code int, reason string) {
-	p.wsMu.Lock()
-	conn, ok := p.wsStreams[id]
-	delete(p.wsStreams, id)
-	p.wsMu.Unlock()
-	if !ok {
-		return
+func (p *Peer) sendWSOpenErr(streamID, errMsg string) {
+	msg, _ := json.Marshal(map[string]interface{}{
+		"type": "ws-open-err", "id": streamID, "error": errMsg,
+	})
+	p.SendDC(msg)
+}
+
+func (p *Peer) handleWSData(raw []byte, streamID string) {
+	if p.onReq != nil {
+		resp, err := p.onReq(p, raw)
+		if err != nil {
+			log.Printf("[proxy] ws-data error: %v", err)
+		}
+		if resp != nil {
+			p.SendDC(resp)
+		}
 	}
-	if code == 0 {
-		code = websocket.CloseNormalClosure
+}
+
+func (p *Peer) handleWSClose(streamID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if ws, ok := p.wsStreams[streamID]; ok {
+		ws.Close()
+		delete(p.wsStreams, streamID)
 	}
-	conn.WriteMessage(websocket.CloseMessage,
-		websocket.FormatCloseMessage(code, reason))
-	conn.Close()
 }
 
 func (p *Peer) closeAllWSStreams() {
-	p.wsMu.Lock()
-	streams := p.wsStreams
-	p.wsStreams = make(map[string]*websocket.Conn)
-	p.wsMu.Unlock()
-	for _, c := range streams {
-		c.Close()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, ws := range p.wsStreams {
+		ws.Close()
 	}
+	p.wsStreams = make(map[string]*websocket.Conn)
+}
+
+// parseICEServers parses comma-separated STUN/TURN URLs into pion ICEServer config.
+func parseICEServers(stunRaw, turnRaw string) []webrtc.ICEServer {
+	var servers []webrtc.ICEServer
+
+	// Parse STUN servers
+	for _, s := range strings.Split(stunRaw, ",") {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		servers = append(servers, webrtc.ICEServer{URLs: []string{s}})
+	}
+
+	// Parse TURN server
+	turnRaw = strings.TrimSpace(turnRaw)
+	if turnRaw != "" {
+		for _, s := range strings.Split(turnRaw, ",") {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			ices := webrtc.ICEServer{}
+			isTurn := strings.HasPrefix(s, "turn:") || strings.HasPrefix(s, "turns:")
+			if isTurn {
+				prefix := "turn:"
+				if strings.HasPrefix(s, "turns:") {
+					prefix = "turns:"
+				}
+				rest := s[len(prefix):] // user:pass@host:port?transport=udp
+				atIdx := strings.LastIndex(rest, "@")
+				if atIdx > 0 {
+					credPart := rest[:atIdx] // user:pass
+					hostPart := rest[atIdx+1:] // host:port?transport=udp
+					colonIdx := strings.Index(credPart, ":")
+					if colonIdx > 0 {
+						ices.Username = credPart[:colonIdx]
+						ices.Credential = credPart[colonIdx+1:]
+						// Reconstruct URL without credentials
+						cleanURL := prefix + hostPart
+						ices.URLs = []string{cleanURL}
+						log.Printf("[webrtc] TURN: user=%q url=%q", ices.Username, cleanURL)
+					}
+				}
+				if ices.Username == "" {
+					ices.URLs = []string{s}
+				}
+			} else {
+				ices.URLs = []string{s}
+			}
+			servers = append(servers, ices)
+		}
+	}
+
+	if len(servers) == 0 {
+		servers = []webrtc.ICEServer{
+			{URLs: []string{"stun:stun.l.google.com:19302"}},
+		}
+	}
+	return servers
+}
+
+func (m *Manager) addPeer(id string, p *Peer) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peers[id] = p
+}
+
+func (m *Manager) removePeer(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.peers, id)
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+func encodeDCMessage(raw []byte) string {
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func (p *Peer) RegisterWSStream(id string, ws *websocket.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.wsStreams[id] = ws
+}
+
+func (p *Peer) UnregisterWSStream(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.wsStreams, id)
+}
+
+func (p *Peer) RouteWSData(id string, data string, binary bool) {
+	// Forward to DC
+	msg, _ := json.Marshal(map[string]interface{}{
+		"type": "ws-data", "id": id, "data": data,
+	})
+	p.SendDC(msg)
+}
+
+func (p *Peer) CloseWSStream(id string, code int, reason string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if ws, ok := p.wsStreams[id]; ok {
+		ws.Close()
+		delete(p.wsStreams, id)
+	}
+}
+
+func (p *Peer) SetTarget(t string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.target = t
+}
+
+func (p *Peer) Target() (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.target, p.target != ""
+}
+
+func (m *Manager) Peer(id string) *Peer {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.peers[id]
 }

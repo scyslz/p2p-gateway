@@ -37,8 +37,13 @@ import (
 // Handler builds a RequestHandler that dispatches to the given target.
 // The target can be http(s) or ws(s).
 func Handler(target string) wrtc.RequestHandler {
-	client := testClient()
 	return func(p *wrtc.Peer, raw []byte) ([]byte, error) {
+		client := testClient()
+		// Disable automatic redirect following — we handle redirects manually
+		// in forwardHTTP with origin and scheme validation.
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
 		var envelope struct {
 			Type string `json:"type"`
 		}
@@ -52,6 +57,7 @@ func Handler(target string) wrtc.RequestHandler {
 			if err := json.Unmarshal(raw, &req); err != nil {
 				return nil, fmt.Errorf("decode request: %w", err)
 			}
+			log.Printf("[proxy] %s %s → %s", req.Method, req.Path, target)
 			resp, err := forwardHTTP(client, target, &req)
 			if err != nil {
 				log.Printf("[proxy] forward error: %v", err)
@@ -133,66 +139,158 @@ type WSClose struct {
 	Reason string `json:"reason"`
 }
 
-// forwardHTTP proxies an HTTP request to the target.
+const maxRedirects = 10
+
+// forwardHTTP proxies an HTTP request to the target, automatically following
+// redirects (301/302/303/307/308) within the same origin. Cross-origin redirects
+// and HTTPS→HTTP downgrades are blocked.
 func forwardHTTP(client *http.Client, target string, in *Request) (*Response, error) {
 	if !strings.HasPrefix(target, "https://") && !strings.HasPrefix(target, "http://") {
 		return nil, fmt.Errorf("target must be http(s) for HTTP requests")
 	}
 
-	u, err := url.Parse(target)
+	targetURL, err := url.Parse(target)
 	if err != nil {
 		return nil, fmt.Errorf("parse target: %w", err)
 	}
+	targetHost := strings.ToLower(targetURL.Hostname())
+	targetScheme := strings.ToLower(targetURL.Scheme)
+
+	// Build the initial request URL.
 	rel, err := url.Parse(in.Path)
 	if err != nil {
 		return nil, fmt.Errorf("parse path: %w", err)
 	}
-	u.Path = singleSlash(u.Path, rel.Path)
-	u.RawQuery = rel.RawQuery
+	// Strip internal query params (target, etc.) — don't forward to upstream.
+	q := rel.Query()
+	q.Del("target")
+	rel.RawQuery = q.Encode()
+	reqURL := *targetURL
+	reqURL.Path = singleSlash(reqURL.Path, rel.Path)
+	reqURL.RawQuery = rel.RawQuery
+	log.Printf("[proxy] resolved URL: %s", reqURL.String())
 
-	var bodyReader io.Reader
+	// Parse body once — may be reused across redirects.
+	var bodyBytes []byte
 	if in.BodyB64 != "" {
-		b, err := base64.StdEncoding.DecodeString(in.BodyB64)
+		bodyBytes, err = base64.StdEncoding.DecodeString(in.BodyB64)
 		if err != nil {
 			return nil, fmt.Errorf("decode body: %w", err)
 		}
-		bodyReader = strings.NewReader(string(b))
 	}
 
-	method := strings.ToUpper(in.Method)
-	if method == "" {
-		method = "GET"
+	originalMethod := strings.ToUpper(in.Method)
+	if originalMethod == "" {
+		originalMethod = "GET"
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, method, u.String(), bodyReader)
-	if err != nil {
-		return nil, fmt.Errorf("new request: %w", err)
-	}
+	currentMethod := originalMethod
 
 	skip := map[string]struct{}{
 		"host": {}, "connection": {}, "upgrade": {}, "keep-alive": {},
 		"proxy-authenticate": {}, "proxy-authorization": {}, "te": {},
 		"trailers": {}, "transfer-encoding": {},
 	}
-	for k, v := range in.Headers {
-		lk := strings.ToLower(k)
-		if _, drop := skip[lk]; drop {
-			continue
+
+	// Follow redirects manually with origin + scheme validation.
+	var lastResp *http.Response
+	for redirectCount := 0; redirectCount <= maxRedirects; redirectCount++ {
+
+		var bodyReader io.Reader
+		if len(bodyBytes) > 0 {
+			bodyReader = strings.NewReader(string(bodyBytes))
 		}
-		req.Header.Set(k, v)
-	}
-	req.Host = u.Hostname()
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("upstream do: %w", err)
-	}
-	defer resp.Body.Close()
+		req, err := http.NewRequestWithContext(context.Background(), currentMethod, reqURL.String(), bodyReader)
+		if err != nil {
+			return nil, fmt.Errorf("new request: %w", err)
+		}
 
-	body, err := io.ReadAll(resp.Body)
+		for k, v := range in.Headers {
+			lk := strings.ToLower(k)
+			if _, drop := skip[lk]; drop {
+				continue
+			}
+			req.Header.Set(k, v)
+		}
+		req.Host = reqURL.Host
+
+		if lastResp != nil {
+			lastResp.Body.Close()
+		}
+		log.Printf("[proxy] >>> %s %s Host=%s", currentMethod, reqURL.String(), req.Host)
+		lastResp, err = client.Do(req)
+		if err != nil {
+			log.Printf("[proxy] <<< err=%v", err)
+			return nil, fmt.Errorf("upstream do: %w", err)
+		}
+		log.Printf("[proxy] <<< status=%d", lastResp.StatusCode)
+
+		// Only auto-follow redirect status codes.
+		if lastResp.StatusCode != 301 && lastResp.StatusCode != 302 &&
+			lastResp.StatusCode != 303 && lastResp.StatusCode != 307 &&
+			lastResp.StatusCode != 308 {
+				break
+		}
+
+		locHeader := lastResp.Header.Get("Location")
+		if locHeader == "" {
+			break
+		}
+
+		locURL, err := url.Parse(locHeader)
+		if err != nil {
+			break
+		}
+
+		// Resolve relative Location against current request URL.
+		nextURL := reqURL.ResolveReference(locURL)
+
+		// --- Security checks ---
+		nextHost := strings.ToLower(nextURL.Hostname())
+		nextScheme := strings.ToLower(nextURL.Scheme)
+
+		// 1. Block cross-origin redirect.
+		if nextHost != targetHost {
+			lastResp.Body.Close()
+				log.Printf("[proxy] blocked cross-origin redirect from=%s to=%s", reqURL.String(), nextURL.String())
+			return errorResponse(in.ID, http.StatusBadGateway, "blocked cross-origin redirect"), nil
+		}
+
+		// 2. Block HTTPS → HTTP downgrade.
+		if targetScheme == "https" && nextScheme == "http" {
+			lastResp.Body.Close()
+				log.Printf("[proxy] blocked insecure redirect from=%s to=%s", reqURL.String(), nextURL.String())
+			return errorResponse(in.ID, http.StatusBadGateway, "blocked insecure redirect"), nil
+		}
+
+		log.Printf("[proxy] redirect %d: %s → %s", redirectCount, reqURL.String(), nextURL.String())
+
+		// 3. For 301/302/303: change POST to GET per HTTP spec.
+		if lastResp.StatusCode == 301 || lastResp.StatusCode == 302 || lastResp.StatusCode == 303 {
+			currentMethod = "GET"
+			bodyBytes = nil // No body for GET.
+		}
+		// 307/308: preserve original method and body.
+
+		reqURL = *nextURL
+	}
+
+	if lastResp == nil {
+		return nil, fmt.Errorf("no response from upstream")
+	}
+	defer lastResp.Body.Close()
+
+	// If the final response is still a redirect, we hit the limit.
+	if lastResp.StatusCode == 301 || lastResp.StatusCode == 302 ||
+		lastResp.StatusCode == 303 || lastResp.StatusCode == 307 ||
+		lastResp.StatusCode == 308 {
+		lastResp.Body.Close()
+		log.Printf("[proxy] redirect limit exceeded (max %d)", maxRedirects)
+		return errorResponse(in.ID, http.StatusBadGateway, "redirect limit exceeded"), nil
+	}
+
+	body, err := io.ReadAll(lastResp.Body)
+	lastResp.Body.Close()
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
@@ -200,16 +298,45 @@ func forwardHTTP(client *http.Client, target string, in *Request) (*Response, er
 	out := &Response{
 		Type:    "response",
 		ID:      in.ID,
-		Status:  resp.StatusCode,
-		Headers: make(map[string]string, len(resp.Header)),
+		Status:  lastResp.StatusCode,
+		Headers: make(map[string]string, len(lastResp.Header)),
 		BodyB64: base64.StdEncoding.EncodeToString(body),
 	}
-	for k, vs := range resp.Header {
+	for k, vs := range lastResp.Header {
 		if len(vs) == 0 {
+			continue
+		}
+		// Rewrite Location header to strip target origin.
+		if strings.EqualFold(k, "location") {
+			for _, v := range vs {
+				if resolved, err2 := url.Parse(v); err2 == nil {
+					abs := lastResp.Request.URL.ResolveReference(resolved)
+					if strings.ToLower(abs.Hostname()) == targetHost {
+						v = abs.RequestURI()
+					}
+				}
+				out.Headers[k] = v
+			}
 			continue
 		}
 		out.Headers[k] = strings.Join(vs, ", ")
 	}
+
+	// Inject <base> tag for HTML responses so relative URLs resolve to upstream.
+	ct := lastResp.Header.Get("Content-Type")
+	if strings.Contains(ct, "text/html") {
+		baseTag := `<base href="` + target + `">`
+		html := string(body)
+		if strings.Contains(html, "<head") {
+			html = strings.Replace(html, "<head", "<head>"+baseTag, 1)
+		} else if strings.Contains(html, "<HEAD") {
+			html = strings.Replace(html, "<HEAD", "<HEAD>"+baseTag, 1)
+		} else {
+			html = baseTag + html
+		}
+		out.BodyB64 = base64.StdEncoding.EncodeToString([]byte(html))
+	}
+
 	return out, nil
 }
 
@@ -323,6 +450,16 @@ func singleSlash(a, b string) string {
 		return a + "/" + b
 	default:
 		return a + b
+	}
+}
+
+func errorResponse(id string, status int, msg string) *Response {
+	return &Response{
+		Type:    "response",
+		ID:      id,
+		Status:  status,
+		Headers: map[string]string{"content-type": "text/plain"},
+		BodyB64: base64.StdEncoding.EncodeToString([]byte(msg)),
 	}
 }
 

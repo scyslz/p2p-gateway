@@ -1,4 +1,4 @@
-// client.js - P2P tunnel with full logging.
+// client.js - P2P tunnel: Gateway creates offer, browser answers.
 
 (function () {
     'use strict';
@@ -20,12 +20,12 @@
         el.className = ok ? 'val ok' : (ok === false ? 'val bad' : 'val');
     }
 
-    const SW_VERSION = 'v3';
+    const SW_VERSION = 'v4';
 
     // --- Service Worker ---
     if ('serviceWorker' in navigator) {
         L('info', 'SW', 'Registering service worker…');
-        navigator.serviceWorker.register('/p2p-sw.js')
+        navigator.serviceWorker.register('/p2p/sw.js', { scope: '/' })
             .then(reg => {
                 if (reg.waiting) {
                     L('warn', 'SW', 'New SW waiting, activating…');
@@ -61,9 +61,12 @@
 
     function startP2P() {
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        let signalUrl = proto + '//' + location.host + '/_signal';
+        let signalUrl = proto + '//' + location.host + '/p2p/signal';
 
-        const urlParam = new URLSearchParams(location.search).get('target');
+        let urlParam = new URLSearchParams(location.search).get('target');
+        if (!urlParam) {
+            try { urlParam = localStorage.getItem('p2p-target'); } catch(e) {}
+        }
         if (urlParam) {
             signalUrl += '?target=' + encodeURIComponent(urlParam);
             L('info', 'TARGET', urlParam);
@@ -95,7 +98,6 @@
         };
 
         let myId = null;
-        let gatewayId = null;
 
         // --- WebRTC ---
         L('info', 'WEBRTC', 'Creating RTCPeerConnection…');
@@ -107,7 +109,7 @@
             if (e.candidate) {
                 const c = e.candidate;
                 L('ice', 'ICE', 'Local candidate: ' + c.candidate.substring(0, 60) + '…');
-                sendSignal({ type: 'candidate', to: gatewayId, candidate: c });
+                sendSignal({ type: 'candidate', to: myId, candidate: c });
             } else {
                 L('ice', 'ICE', 'Gathering complete');
             }
@@ -135,69 +137,76 @@
             L('ice', 'ICE', 'ICE state: ' + pc.iceConnectionState);
         };
 
-        // --- DataChannel ---
-        L('info', 'DC', 'Creating DataChannel "http"…');
-        dc = pc.createDataChannel('http', { ordered: true });
+        // Gateway creates DataChannel, browser receives it
+        pc.ondatachannel = (event) => {
+            dc = event.channel;
+            L('ok', 'DC', 'Received DataChannel: ' + dc.label);
 
-        dc.onopen = () => {
-            setRow('dc', 'OPEN', true);
-            setStatus('✅ Ready', true);
-            L('ok', 'DC', 'DataChannel opened — tunnel ready');
-            const bar = document.getElementById('loading-bar');
-            if (bar) { bar.classList.remove('active'); bar.style.width = '100%'; }
-            notifySW(true);
-        };
+            dc.onopen = () => {
+                setRow('dc', 'OPEN', true);
+                setStatus('✅ Ready', true);
+                L('ok', 'DC', 'DataChannel opened — tunnel ready');
+                const bar = document.getElementById('loading-bar');
+                if (bar) { bar.classList.remove('active'); bar.style.width = '100%'; }
+                notifySW(true);
+                // Redirect to target root after a short delay for SW to be ready
+                setTimeout(() => {
+                    L('info', 'NAV', 'Redirecting to target...');
+                    window.location.href = '/';
+                }, 500);
+            };
 
-        dc.onclose = () => {
-            setRow('dc', 'CLOSED', false);
-            setStatus('DataChannel closed', false);
-            L('err', 'DC', 'DataChannel closed');
-            notifySW(false);
-        };
+            dc.onclose = () => {
+                setRow('dc', 'CLOSED', false);
+                setStatus('DataChannel closed', false);
+                L('err', 'DC', 'DataChannel closed');
+                notifySW(false);
+            };
 
-        dc.onerror = (e) => {
-            L('err', 'DC', 'DataChannel error: ' + (e.error?.message || e));
-        };
+            dc.onerror = (e) => {
+                L('err', 'DC', 'DataChannel error: ' + (e.error?.message || e));
+            };
 
-        dc.onmessage = (event) => {
-            let msg;
-            try { msg = JSON.parse(event.data); } catch { return; }
-
-            if (msg.type === 'response') {
-                const port = inflight.get(msg.id);
-                if (!port) return;
-                inflight.delete(msg.id);
-                L('tunnel', 'HTTP', '← ' + msg.status + ' ' + (msg.headers?.['content-type'] || '') + ' id=' + msg.id);
-                port.postMessage({ type: 'response', ...msg });
-            } else if (msg.type === 'ws-open-ok') {
-                const port = wsStreams.get(msg.id);
-                if (!port) return;
-                L('ok', 'WS', 'Upstream connected id=' + msg.id);
-                port.postMessage(msg);
-            } else if (msg.type === 'ws-open-err') {
-                const port = wsStreams.get(msg.id);
-                if (!port) return;
-                L('err', 'WS', 'Upstream failed: ' + msg.error + ' id=' + msg.id);
-                port.postMessage(msg);
-                wsStreams.delete(msg.id);
-            } else if (msg.type === 'ws-data') {
-                const port = wsStreams.get(msg.id);
-                if (!port) return;
-                const size = msg.data ? Math.round(msg.data.length * 3 / 4) : 0;
-                L('tunnel', 'WS', '← ' + (msg.binary ? 'binary' : 'text') + ' ' + size + 'B id=' + msg.id);
-                port.postMessage(msg);
-            } else if (msg.type === 'ws-closed') {
-                const port = wsStreams.get(msg.id);
-                if (!port) return;
-                L('warn', 'WS', 'Closed code=' + msg.code + ' id=' + msg.id);
-                port.postMessage(msg);
-                wsStreams.delete(msg.id);
-            }
+            dc.onmessage = (event) => {
+                let msg;
+                try { msg = JSON.parse(event.data); } catch { return; }
+                if (msg.type === 'response') {
+                    const port = inflight.get(msg.id);
+                    if (!port) return;
+                    inflight.delete(msg.id);
+                    L('tunnel', 'HTTP', '← ' + msg.status + ' ' + (msg.headers?.['content-type'] || '') + ' id=' + msg.id);
+                    port.postMessage({ type: 'response', ...msg });
+                } else if (msg.type === 'ws-open-ok') {
+                    const port = wsStreams.get(msg.id);
+                    if (!port) return;
+                    L('ok', 'WS', 'Upstream connected id=' + msg.id);
+                    port.postMessage(msg);
+                } else if (msg.type === 'ws-open-err') {
+                    const port = wsStreams.get(msg.id);
+                    if (!port) return;
+                    L('err', 'WS', 'Upstream failed: ' + msg.error + ' id=' + msg.id);
+                    port.postMessage(msg);
+                    wsStreams.delete(msg.id);
+                } else if (msg.type === 'ws-data') {
+                    const port = wsStreams.get(msg.id);
+                    if (!port) return;
+                    const size = msg.data ? Math.round(msg.data.length * 3 / 4) : 0;
+                    L('tunnel', 'WS', '← ' + (msg.binary ? 'binary' : 'text') + ' ' + size + 'B id=' + msg.id);
+                    port.postMessage(msg);
+                } else if (msg.type === 'ws-closed') {
+                    const port = wsStreams.get(msg.id);
+                    if (!port) return;
+                    L('warn', 'WS', 'Closed code=' + msg.code + ' id=' + msg.id);
+                    port.postMessage(msg);
+                    wsStreams.delete(msg.id);
+                }
+            };
         };
 
         function notifySW(open) {
             if (navigator.serviceWorker.controller) {
-                navigator.serviceWorker.controller.postMessage({ type: 'dc-state', open });
+                const target = new URLSearchParams(location.search).get('target') || cfg.target || '';
+                navigator.serviceWorker.controller.postMessage({ type: 'dc-state', open, target });
             }
         }
 
@@ -208,7 +217,7 @@
             if (!port) return;
 
             if (msg.type === 'tunnel' && msg.payload) {
-                if (dc.readyState !== 'open') {
+                if (!dc || dc.readyState !== 'open') {
                     port.postMessage({ type: 'error', error: 'dc not open' });
                     return;
                 }
@@ -224,7 +233,7 @@
                     }
                 }, 20000);
             } else if (msg.type === 'ws-tunnel' && msg.payload) {
-                if (dc.readyState !== 'open') {
+                if (!dc || dc.readyState !== 'open') {
                     port.postMessage({ type: 'error', error: 'dc not open' });
                     return;
                 }
@@ -232,13 +241,13 @@
                 L('tunnel', 'WS', '→ Open ' + msg.payload.path + ' id=' + msg.payload.id);
                 dc.send(JSON.stringify(msg.payload));
             } else if (msg.type === 'ws-data-send' && msg.payload) {
-                if (dc.readyState === 'open') {
+                if (dc && dc.readyState === 'open') {
                     const size = msg.payload.data ? Math.round(msg.payload.data.length * 3 / 4) : 0;
                     L('tunnel', 'WS', '→ Data ' + size + 'B id=' + msg.payload.id);
                     dc.send(JSON.stringify(msg.payload));
                 }
             } else if (msg.type === 'ws-close-send' && msg.payload) {
-                if (dc.readyState === 'open') {
+                if (dc && dc.readyState === 'open') {
                     L('tunnel', 'WS', '→ Close id=' + msg.payload.id);
                     dc.send(JSON.stringify(msg.payload));
                     wsStreams.delete(msg.payload.id);
@@ -247,6 +256,7 @@
         });
 
         // --- Signaling messages ---
+        // Gateway creates offer, browser answers
         ws.onmessage = async (event) => {
             let msg;
             try { msg = JSON.parse(event.data); } catch { return; }
@@ -254,19 +264,15 @@
             if (msg.type === 'join') {
                 myId = msg.id;
                 L('signal', 'SIGNAL', 'Joined as peer ' + myId);
-            } else if (msg.type === 'peer-joined') {
-                if (myId && msg.id !== myId) {
-                    gatewayId = msg.id;
-                    L('signal', 'SIGNAL', 'Gateway peer: ' + gatewayId);
-                    L('info', 'WEBRTC', 'Creating SDP offer…');
-                    const offer = await pc.createOffer();
-                    await pc.setLocalDescription(offer);
-                    L('signal', 'SIGNAL', '→ Offer sent');
-                    sendSignal({ type: 'offer', to: gatewayId, sdp: offer });
-                }
-            } else if (msg.type === 'answer') {
+            } else if (msg.type === 'offer') {
+                // Gateway sends offer to browser
+                L('signal', 'SIGNAL', '← Offer received from Gateway');
                 await pc.setRemoteDescription(msg.sdp);
-                L('signal', 'SIGNAL', '← Answer received');
+                L('info', 'WEBRTC', 'Creating SDP answer…');
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                L('signal', 'SIGNAL', '→ Answer sent');
+                sendSignal({ type: 'answer', to: myId, sdp: answer });
             } else if (msg.type === 'candidate') {
                 try {
                     await pc.addIceCandidate(msg.candidate);

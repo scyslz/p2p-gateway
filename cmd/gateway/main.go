@@ -127,11 +127,26 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// Signaling endpoint: supports ?target=<url> to override upstream.
-	mux.HandleFunc("/_signal", func(w http.ResponseWriter, r *http.Request) {
-		// Resolve target: query param > global config > host routing.
-		target := resolveTarget(r)
+	// ── P2P Control Plane: /p2p/* ──────────────────────────────
 
+	// /p2p/ → Bootstrap page.
+	mux.HandleFunc("/p2p/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+		serveP2PStatic(w, r)
+	})
+
+	// /p2p/sw.js → Service Worker with scope = /.
+	mux.HandleFunc("/p2p/sw.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Service-Worker-Allowed", "/")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		serveP2PFile(w, "p2p-sw.js", "application/javascript")
+	})
+
+	// /p2p/signal → WebSocket Signaling.
+	mux.HandleFunc("/p2p/signal", func(w http.ResponseWriter, r *http.Request) {
+		target := resolveTarget(r)
 		hub.ServeWS(w, r, func(p *signaling.Peer) {
 			if err := mgr.HandleSignalingPeer(p); err != nil {
 				log.Printf("[signal] handle peer: %v", err)
@@ -143,20 +158,29 @@ func main() {
 		})
 	})
 
-	// Reverse-proxy fallback.
-	mux.HandleFunc("/upstream/", func(w http.ResponseWriter, r *http.Request) {
-		handleDirect(resolver, w, r)
-	})
-	mux.HandleFunc("/upstream", func(w http.ResponseWriter, r *http.Request) {
-		handleDirect(resolver, w, r)
+	// /p2p/status → P2P status JSON.
+	mux.HandleFunc("/p2p/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"ok","service_worker":true}`))
 	})
 
-	// Static bootstrap files.
+	// ── Legacy redirects ────────────────────────────────────────
+	mux.HandleFunc("/_signal", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/p2p/signal"+r.URL.RawQuery, http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("/signal", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/p2p/signal"+r.URL.RawQuery, http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("/p2p-sw.js", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/p2p/sw.js", http.StatusMovedPermanently)
+	})
+
+	// ── Target Proxy: /* ────────────────────────────────────────
+	// Root path and all non-/p2p/ paths are Target resources.
+	// Service Worker intercepts browser requests and tunnels them
+	// through WebRTC DataChannel. The Gateway proxies to the target.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Bypass browser cache — force fresh load.
-		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-		w.Header().Set("Pragma", "no-cache")
-		w.Header().Set("Expires", "0")
+		// /p2p/* handled above; this is target proxy fallback.
 		serveStatic(w, r)
 	})
 
@@ -243,6 +267,60 @@ func proxyFactory(resolver *routing.Resolver) wrtc.RequestHandler {
 	}
 }
 
+func handleDirectWithTarget(target string, r *http.Request, w http.ResponseWriter) {
+	path := r.URL.Path
+	if strings.HasPrefix(path, "/upstream") {
+		path = strings.TrimPrefix(path, "/upstream")
+		if path == "" {
+			path = "/"
+		}
+	}
+
+	u, _ := url.Parse(target)
+	rel, _ := url.Parse(path)
+	u.Path = singleSlash(u.Path, rel.Path)
+	u.RawQuery = r.URL.RawQuery
+
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, u.String(), r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	for k, vs := range r.Header {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	req.Host = u.Hostname()
+
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return nil
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vs := range resp.Header {
+		if strings.EqualFold(k, "location") {
+			vs = rewriteLocation(vs, r.Host, target)
+		}
+		if strings.EqualFold(k, "set-cookie") {
+			continue
+		}
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
 func handleDirect(resolver *routing.Resolver, w http.ResponseWriter, r *http.Request) {
 	// Use the same target resolution logic as signaling.
 	target := resolveTarget(r)
@@ -318,6 +396,50 @@ func rewriteLocation(values []string, gatewayHost, upstream string) []string {
 	return out
 }
 
+func serveP2PStatic(w http.ResponseWriter, r *http.Request) {
+	// Strip /p2p/ prefix to get the file path within web/files.
+	path := strings.TrimPrefix(r.URL.Path, "/p2p/")
+	if path == "" {
+		path = "index.html"
+	}
+	b, err := fs.ReadFile(webFS, path)
+	if err != nil {
+		w.WriteHeader(404)
+		return
+	}
+	if path == "index.html" {
+		page := string(b)
+		target, _ := resolveFromHost(r.Host)
+		stun := gatewayCfg.STUNURL
+		cfgJSON, _ := json.Marshal(map[string]string{
+			"host":   r.Host,
+			"target": target,
+			"stun":   stun,
+		})
+		page = strings.Replace(page, "/*__P2P_CONFIG__*/null", string(cfgJSON), 1)
+		b = []byte(page)
+	}
+	switch {
+	case strings.HasSuffix(path, ".html"):
+		w.Header().Set("content-type", "text/html; charset=utf-8")
+	case strings.HasSuffix(path, ".js"):
+		w.Header().Set("content-type", "application/javascript")
+	case strings.HasSuffix(path, ".css"):
+		w.Header().Set("content-type", "text/css")
+	}
+	_, _ = w.Write(b)
+}
+
+func serveP2PFile(w http.ResponseWriter, name, contentType string) {
+	b, err := fs.ReadFile(webFS, name)
+	if err != nil {
+		w.WriteHeader(404)
+		return
+	}
+	w.Header().Set("content-type", contentType)
+	_, _ = w.Write(b)
+}
+
 func serveStatic(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/")
 	if path == "" {
@@ -326,7 +448,7 @@ func serveStatic(w http.ResponseWriter, r *http.Request) {
 
 	b, err := fs.ReadFile(webFS, path)
 	if err != nil {
-		http.NotFound(w, r)
+		w.WriteHeader(404)
 		return
 	}
 

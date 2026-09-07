@@ -17,13 +17,16 @@
 let dcReady = false;
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (event) => {
-    // Take control of all clients immediately.
     event.waitUntil(self.clients.claim());
 });
 self.addEventListener('message', (event) => {
     const msg = event.data || {};
     if (msg.type === 'dc-state') {
         dcReady = !!msg.open;
+        if (dcReady && msg.target) {
+            // Store target for reconnect after refresh
+            try { localStorage.setItem('p2p-target', msg.target); } catch(e) {}
+        }
     }
     if (msg.type === 'skip-waiting') {
         self.skipWaiting();
@@ -32,10 +35,10 @@ self.addEventListener('message', (event) => {
 
 // Files that are NEVER tunneled — always served directly by the gateway.
 const SKIP = new Set([
-    '/', '/index.html',
     '/_signal',
     '/p2p-sw.js',
     '/client.js',
+    '/index.html',
 ]);
 
 self.addEventListener('fetch', (event) => {
@@ -47,8 +50,18 @@ self.addEventListener('fetch', (event) => {
         return;
     }
 
-    // If DataChannel is not open, fall back to direct fetch immediately.
+    // If DataChannel is not open, check if we have a stored target
     if (!dcReady) {
+        try {
+            const storedTarget = localStorage.getItem('p2p-target');
+            if (storedTarget && url.pathname === '/' && !url.searchParams.has('target')) {
+                // Redirect to setup page with stored target
+                return new Response(null, {
+                    status: 302,
+                    headers: { 'Location': '/?target=' + encodeURIComponent(storedTarget) }
+                });
+            }
+        } catch(e) {}
         return; // browser default — no interception
     }
 
@@ -63,6 +76,7 @@ self.addEventListener('fetch', (event) => {
 });
 
 async function forward(req) {
+    const url = new URL(req.url);
     if (dcReady) {
         try {
             return await p2pFetch(req);
@@ -71,8 +85,12 @@ async function forward(req) {
         }
     }
     // Fallback: regular fetch against the gateway's reverse-proxy path.
-    const directURL = new URL('/upstream' + new URL(req.url).pathname + new URL(req.url).search, location.origin);
-    return fetch(directURL.toString(), {
+    const fallbackUrl = new URL('/upstream' + url.pathname + url.search, location.origin);
+    try {
+        const storedTarget = localStorage.getItem('p2p-target');
+        if (storedTarget) fallbackUrl.searchParams.set('target', storedTarget);
+    } catch(e) {}
+    return fetch(fallbackUrl.toString(), {
         method: req.method,
         headers: req.headers,
         body: req.method === 'GET' || req.method === 'HEAD' ? undefined : await req.clone().arrayBuffer(),
@@ -171,13 +189,22 @@ function p2pFetch(req) {
         req.headers.forEach((v, k) => { headers[k] = v; });
 
         const send = (bodyB64) => {
+            // Strip /p2p/ prefix — target resources use root paths.
+            // Keep ?target= param so the proxy knows which upstream to use.
+            let reqPath = url.pathname;
+            if (reqPath.startsWith('/p2p/')) {
+                reqPath = reqPath.substring(4); // strip /p2p → /...
+            } else if (reqPath === '/p2p') {
+                reqPath = '/';
+            }
+            const cleanPath = reqPath + url.search;
             const frame = {
                 type: 'tunnel',
                 payload: {
                     type: 'request',
                     id,
                     method: req.method,
-                    path: url.pathname + url.search,
+                    path: cleanPath,
                     headers,
                     body: bodyB64 || ''
                 }
@@ -240,7 +267,15 @@ function buildResponse(msg) {
     for (const k of Object.keys(msg.headers || {})) {
         try { h.set(k, msg.headers[k]); } catch (e) { /* skip */ }
     }
-    const body = msg.body ? base64ToArrayBuffer(msg.body) : null;
+    let body = null;
+    if (msg.body) {
+        try {
+            body = base64ToArrayBuffer(msg.body);
+        } catch(e) {
+            console.error('[p2p-sw] base64 decode failed:', e);
+        }
+    }
+    console.log('[p2p-sw] buildResponse status=' + msg.status + ' bodyLen=' + (body ? body.byteLength : 0));
     return new Response(body, {
         status: msg.status || 200,
         statusText: STATUS_TEXT[msg.status] || '',

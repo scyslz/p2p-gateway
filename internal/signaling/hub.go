@@ -33,6 +33,9 @@ type Peer struct {
 	// addressed to this peer arrives.
 	Inbox chan []byte
 
+	// OnMessage: if set, readPump calls this instead of room routing.
+	OnMessage func(msg []byte)
+
 	Room string
 
 	mu     sync.Mutex
@@ -131,10 +134,10 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request, onPeer OnPeer) {
 	peer := &Peer{
 		ID:   newID(),
 		Conn: conn,
-		Send: make(chan []byte, 64),
+		Send: make(chan []byte, 128),
 		// Inbox is unbuffered so that slow WebRTC layers naturally apply
 		// backpressure to the signaling read goroutine.
-		Inbox: make(chan []byte),
+		Inbox: make(chan []byte, 64),
 		Room:  roomName,
 	}
 
@@ -147,9 +150,6 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request, onPeer OnPeer) {
 	joinMsg, _ := json.Marshal(map[string]string{"type": "join", "id": peer.ID})
 	peer.Send <- joinMsg
 
-	// Notify others.
-	notice, _ := json.Marshal(map[string]string{"type": "peer-joined", "id": peer.ID})
-	room.broadcast(notice, peer.ID, peer)
 
 	if onPeer != nil {
 		onPeer(peer)
@@ -214,6 +214,11 @@ func readPump(room *Room, p *Peer) {
 			continue
 		}
 
+		log.Printf("[signal] recv type=%s from=%s to=%s", env.Type, p.ID, env.To)
+		if p.OnMessage != nil {
+			p.OnMessage(msg)
+			continue
+		}
 		if env.To == "" {
 			// Broadcast.
 			room.broadcast(msg, p.ID, p)
