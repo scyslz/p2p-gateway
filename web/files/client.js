@@ -1,33 +1,48 @@
 // client.js - bootstraps the WebRTC P2P tunnel from the browser side.
-//
-// Connects to /_signal?target=<url> to specify the upstream.
-// Supports HTTP and WebSocket tunneling over DataChannel.
 
 (function () {
     'use strict';
 
     const cfg = window.__GATEWAY_CONFIG__ || {};
-    document.getElementById('target').textContent = cfg.target || '(unknown)';
+    document.getElementById('target').textContent = cfg.target || '(url param)';
     document.getElementById('host').textContent = cfg.host || location.host;
     document.getElementById('stun').textContent = cfg.stun || '(none)';
 
     function setRow(id, text, ok) {
         const el = document.getElementById(id);
         el.textContent = text;
-        el.className = ok ? 'val ok' : 'val bad';
+        el.className = ok ? 'val ok' : (ok === false ? 'val bad' : 'val');
     }
 
     function setStatus(text, ok) {
         const el = document.getElementById('status');
         el.textContent = text;
-        el.className = ok ? 'val ok' : 'val bad';
+        el.className = ok ? 'val ok' : (ok === false ? 'val bad' : 'val');
     }
 
-    // 1. Register the Service Worker.
+    // Version string — bump this to force SW update.
+    const SW_VERSION = 'v2';
+
+    // 1. Register Service Worker with cache-busting version.
     if ('serviceWorker' in navigator) {
-        navigator.serviceWorker.register('/p2p-sw.js', { scope: '/' })
+        navigator.serviceWorker.register('/p2p-sw.js?_=' + SW_VERSION, { scope: '/' })
             .then(reg => {
-                setRow('sw', 'OK', true);
+                // If a new SW is waiting, activate it immediately.
+                if (reg.waiting) {
+                    reg.waiting.postMessage({ type: 'skip-waiting' });
+                }
+                reg.addEventListener('updatefound', () => {
+                    const newSw = reg.installing;
+                    if (newSw) {
+                        newSw.addEventListener('statechange', () => {
+                            if (newSw.state === 'installed' && navigator.serviceWorker.controller) {
+                                // New SW installed, activate it.
+                                newSw.postMessage({ type: 'skip-waiting' });
+                            }
+                        });
+                    }
+                });
+                setRow('sw', 'OK (' + SW_VERSION + ')', true);
                 return navigator.serviceWorker.ready;
             })
             .then(() => startP2P())
@@ -38,27 +53,39 @@
 
     let dc = null;
     let ws = null;
-    const inflight = new Map(); // id → MessagePort
-    const wsStreams = new Map(); // id → MessagePort (for ws-data routing)
+    const inflight = new Map();
+    const wsStreams = new Map();
 
     function startP2P() {
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        // Pass target as query param if set.
         let signalUrl = proto + '//' + location.host + '/_signal';
+
+        // Pass target from URL param or config.
         const urlParam = new URLSearchParams(location.search).get('target');
         if (urlParam) {
             signalUrl += '?target=' + encodeURIComponent(urlParam);
         } else if (cfg.target) {
             signalUrl += '?target=' + encodeURIComponent(cfg.target);
         }
+
+        setStatus('Connecting signaling…');
         ws = new WebSocket(signalUrl);
 
-        ws.onopen = () => setRow('signal', 'OK', true);
+        ws.onopen = () => {
+            setRow('signal', 'OK', true);
+            setStatus('Signaling connected, waiting for WebRTC…');
+        };
         ws.onclose = () => {
             setRow('signal', 'closed', false);
             setStatus('Disconnected', false);
         };
-        ws.onerror = () => setRow('signal', 'error', false);
+        ws.onerror = () => {
+            setRow('signal', 'error', false);
+            setStatus('Signaling error', false);
+            if (window.__showError) {
+                window.__showError('WebSocket signaling failed. Check if the gateway is reachable.');
+            }
+        };
 
         let myId = null;
         let gatewayId = null;
@@ -74,14 +101,23 @@
         };
 
         pc.onconnectionstatechange = () => {
-            setRow('ice', pc.connectionState, pc.connectionState === 'connected');
+            const s = pc.connectionState;
+            setRow('ice', s, s === 'connected');
+            if (s === 'connected') {
+                setStatus('WebRTC connected, waiting for DataChannel…');
+            } else if (s === 'failed' || s === 'disconnected') {
+                setStatus('WebRTC ' + s, false);
+            }
         };
 
         dc = pc.createDataChannel('http', { ordered: true });
 
         dc.onopen = () => {
             setRow('dc', 'OPEN', true);
-            setStatus('Connected', true);
+            setStatus('✅ Connected — ready to tunnel', true);
+            // Hide loading bar
+            const bar = document.getElementById('loading-bar');
+            if (bar) { bar.classList.remove('active'); bar.style.width = '100%'; }
             notifySW(true);
         };
 
@@ -96,27 +132,20 @@
             try { msg = JSON.parse(event.data); } catch { return; }
 
             if (msg.type === 'response') {
-                // HTTP response
                 const port = inflight.get(msg.id);
                 if (!port) return;
                 inflight.delete(msg.id);
                 port.postMessage({ type: 'response', ...msg });
             } else if (msg.type === 'ws-open-ok' || msg.type === 'ws-open-err') {
-                // WebSocket open result
                 const port = wsStreams.get(msg.id);
                 if (!port) return;
                 port.postMessage(msg);
-                if (msg.type === 'ws-open-err') {
-                    wsStreams.delete(msg.id);
-                }
+                if (msg.type === 'ws-open-err') wsStreams.delete(msg.id);
             } else if (msg.type === 'ws-data' || msg.type === 'ws-closed') {
-                // WebSocket data/close
                 const port = wsStreams.get(msg.id);
                 if (!port) return;
                 port.postMessage(msg);
-                if (msg.type === 'ws-closed') {
-                    wsStreams.delete(msg.id);
-                }
+                if (msg.type === 'ws-closed') wsStreams.delete(msg.id);
             }
         };
 
@@ -126,14 +155,12 @@
             }
         }
 
-        // Receive messages from the SW.
         navigator.serviceWorker.addEventListener('message', (event) => {
             const msg = event.data || {};
             const port = event.ports && event.ports[0];
             if (!port) return;
 
             if (msg.type === 'tunnel' && msg.payload) {
-                // HTTP tunnel
                 if (dc.readyState !== 'open') {
                     port.postMessage({ type: 'error', error: 'datachannel not open' });
                     return;
@@ -148,7 +175,6 @@
                     }
                 }, 20000);
             } else if (msg.type === 'ws-tunnel' && msg.payload) {
-                // WebSocket tunnel
                 if (dc.readyState !== 'open') {
                     port.postMessage({ type: 'error', error: 'datachannel not open' });
                     return;
@@ -156,12 +182,8 @@
                 wsStreams.set(msg.payload.id, port);
                 dc.send(JSON.stringify(msg.payload));
             } else if (msg.type === 'ws-data-send' && msg.payload) {
-                // Forward ws-data from SW to DataChannel
-                if (dc.readyState === 'open') {
-                    dc.send(JSON.stringify(msg.payload));
-                }
+                if (dc.readyState === 'open') dc.send(JSON.stringify(msg.payload));
             } else if (msg.type === 'ws-close-send' && msg.payload) {
-                // Forward ws-close from SW to DataChannel
                 if (dc.readyState === 'open') {
                     dc.send(JSON.stringify(msg.payload));
                     wsStreams.delete(msg.payload.id);
@@ -178,6 +200,7 @@
             } else if (msg.type === 'peer-joined') {
                 if (myId && msg.id !== myId) {
                     gatewayId = msg.id;
+                    setStatus('Creating WebRTC offer…');
                     const offer = await pc.createOffer();
                     await pc.setLocalDescription(offer);
                     sendSignal({ type: 'offer', to: gatewayId, sdp: offer });

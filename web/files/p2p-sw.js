@@ -15,15 +15,20 @@
 'use strict';
 
 let dcReady = false;
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (event) => {
+    // Take control of all clients immediately.
+    event.waitUntil(self.clients.claim());
+});
 self.addEventListener('message', (event) => {
     const msg = event.data || {};
     if (msg.type === 'dc-state') {
         dcReady = !!msg.open;
     }
+    if (msg.type === 'skip-waiting') {
+        self.skipWaiting();
+    }
 });
-
-self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
 
 // Files that are NEVER tunneled — always served directly by the gateway.
 const SKIP = new Set([

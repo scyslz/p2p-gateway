@@ -3,6 +3,5 @@ tls_cert: ""
 tls_key: ""
 base_domain: "localhost"
 prefix: "p2p-"
-stun_url: "stun:stun.l.google.com:19302"
+stun_url: "stun:dd.oci.asher.kdns.fr:3478"
 scheme: "http"
-# target: "http://127.0.0.1:3000"  # uncomment to set a fixed upstream
