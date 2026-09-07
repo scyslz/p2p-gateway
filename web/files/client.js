@@ -25,7 +25,7 @@
     // --- Service Worker ---
     if ('serviceWorker' in navigator) {
         L('info', 'SW', 'Registering service worker…');
-        navigator.serviceWorker.register('/p2p-sw.js?_=' + SW_VERSION, { scope: '/' })
+        navigator.serviceWorker.register('/p2p-sw.js')
             .then(reg => {
                 if (reg.waiting) {
                     L('warn', 'SW', 'New SW waiting, activating…');
