@@ -1,9 +1,3 @@
-// Package webrtc wires pion/webrtc to the signaling hub and the proxy.
-//
-// The gateway acts as the WebRTC "answerer".  When a browser sends an
-// SDP offer via the signaling channel, we create a PeerConnection,
-// reply with an SDP answer, and once the DataChannel "http" opens we
-// start serving HTTP and WebSocket requests over it.
 package webrtc
 
 import (
@@ -20,26 +14,20 @@ import (
 	"github.com/example/p2p-gateway/internal/signaling"
 )
 
-// Peer is one browser-side WebRTC peer attached to the gateway.
 type Peer struct {
 	signaling *signaling.Peer
 	pc        *webrtc.PeerConnection
 	dc        *webrtc.DataChannel
-
-	inbox  chan []byte
-	target string
-
-	mu     sync.Mutex
-	closed bool
-	onReq  RequestHandler
-
-	// WebSocket stream multiplexing: id → upstream conn
+	inbox     chan []byte
+	target    string
+	mu        sync.Mutex
+	closed    bool
+	onReq     RequestHandler
 	wsMu      sync.Mutex
 	wsStreams map[string]*websocket.Conn
 }
 
 func (p *Peer) SetTarget(t string) { p.target = t }
-
 func (p *Peer) Target() (string, error) {
 	if p.target == "" {
 		return "", fmt.Errorf("no target configured")
@@ -49,20 +37,17 @@ func (p *Peer) Target() (string, error) {
 
 type RequestHandler func(p *Peer, req []byte) ([]byte, error)
 
-// Config for creating PeerConnections.
 type Config struct {
-	STUNURL string // comma-separated STUN URLs
-	TURNURL string // optional TURN URL
+	STUNURL string
+	TURNURL string
 }
 
-// Manager owns the API.
 type Manager struct {
 	api     *webrtc.API
 	cfg     Config
 	handler RequestHandler
-
-	mu    sync.Mutex
-	peers map[string]*Peer
+	mu      sync.Mutex
+	peers   map[string]*Peer
 }
 
 func NewManager(cfg Config, handler RequestHandler) (*Manager, error) {
@@ -88,55 +73,59 @@ func (m *Manager) removePeer(id string) {
 	m.mu.Unlock()
 }
 
-// buildICEServers parses the comma-separated STUN URLs and optional TURN URL
-// into []webrtc.ICEServer for the peer connection.
-func (m *Manager) buildICEServers() []webrtc.ICEServer {
+// parseICEServers parses comma-separated STUN URLs and optional TURN URLs
+// into []webrtc.ICEServer. TURN URLs in turn:user:pass@host:port format
+// are parsed and credentials are set separately.
+func parseICEServers(stunCSV, turnCSV string) []webrtc.ICEServer {
 	var servers []webrtc.ICEServer
 
-	// STUN servers (comma-separated)
-	if m.cfg.STUNURL != "" {
-		for _, s := range strings.Split(m.cfg.STUNURL, ",") {
-			s = strings.TrimSpace(s)
-			if s != "" {
-				servers = append(servers, webrtc.ICEServer{
-					URLs: []string{s},
-				})
-			}
+	// STUN servers — just pass through
+	for _, s := range strings.Split(stunCSV, ",") {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			servers = append(servers, webrtc.ICEServer{URLs: []string{s}})
 		}
 	}
 
-	// Optional TURN server
-	if m.cfg.TURNURL != "" {
-		for _, s := range strings.Split(m.cfg.TURNURL, ",") {
-			s = strings.TrimSpace(s)
-			if s == "" {
-				continue
+	// TURN servers — parse credentials from URL
+	for _, s := range strings.Split(turnCSV, ",") {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+
+		ices := webrtc.ICEServer{}
+		isTurn := strings.HasPrefix(s, "turn:") || strings.HasPrefix(s, "turns:")
+
+		if isTurn {
+			prefix := "turn:"
+			if strings.HasPrefix(s, "turns:") {
+				prefix = "turns:"
 			}
-			ices := webrtc.ICEServer{
-				URLs: []string{s},
-			}
-			// Parse turn:user:pass@host format
-			if strings.HasPrefix(s, "turn:") || strings.HasPrefix(s, "turns:") {
-				// Extract credentials from URL if present
-				// Format: turn:user:password@host:port
-				atIdx := strings.LastIndex(s, "@")
-				if atIdx > 0 {
-					beforeAt := s[:atIdx]
-					// turn:user:pass → username=user, credential=pass
-					idx := strings.Index(beforeAt, "://")
-					if idx >= 0 {
-						cred := beforeAt[idx+3:]
-						colonIdx := strings.Index(cred, ":")
-						if colonIdx >= 0 {
-							ices.Username = cred[:colonIdx]
-							ices.Credential = cred[colonIdx+1:]
-							ices.URLs = []string{s}
-						}
-					}
+			// s = turn:user:pass@host:port?transport=udp
+			rest := s[len(prefix):] // user:pass@host:port?transport=udp
+			atIdx := strings.LastIndex(rest, "@")
+			if atIdx > 0 {
+				credPart := rest[:atIdx] // user:pass
+				hostPart := rest[atIdx+1:] // host:port?transport=udp
+				colonIdx := strings.Index(credPart, ":")
+				if colonIdx > 0 {
+					ices.Username = credPart[:colonIdx]
+					ices.Credential = credPart[colonIdx+1:]
+					// Reconstruct URL without credentials: turn:host:port?transport=udp
+					cleanURL := prefix + hostPart
+					ices.URLs = []string{cleanURL}
+					log.Printf("[webrtc] TURN: user=%q url=%q", ices.Username, cleanURL)
 				}
 			}
-			servers = append(servers, ices)
+			if ices.Username == "" {
+				// Fallback: use original URL
+				ices.URLs = []string{s}
+			}
+		} else {
+			ices.URLs = []string{s}
 		}
+		servers = append(servers, ices)
 	}
 
 	if len(servers) == 0 {
@@ -144,14 +133,15 @@ func (m *Manager) buildICEServers() []webrtc.ICEServer {
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
 		}
 	}
-
-	log.Printf("[webrtc] ICE servers: %v", servers)
 	return servers
 }
 
 func (m *Manager) HandleSignalingPeer(sp *signaling.Peer) error {
+	iceServers := parseICEServers(m.cfg.STUNURL, m.cfg.TURNURL)
+	log.Printf("[webrtc] ICE servers: %+v", iceServers)
+
 	pc, err := m.api.NewPeerConnection(webrtc.Configuration{
-		ICEServers: m.buildICEServers(),
+		ICEServers: iceServers,
 	})
 	if err != nil {
 		return fmt.Errorf("new peer connection: %w", err)
@@ -192,15 +182,12 @@ func (m *Manager) HandleSignalingPeer(sp *signaling.Peer) error {
 
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		if dc.Label() != "http" {
-			log.Printf("[webrtc] ignoring data channel %q", dc.Label())
 			return
 		}
 		p.dc = dc
 		log.Printf("[webrtc] data channel %q opened", dc.Label())
-
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			if !msg.IsString {
-				log.Printf("[webrtc] ignoring non-string message")
 				return
 			}
 			resp, err := p.onReq(p, msg.Data)
@@ -209,15 +196,10 @@ func (m *Manager) HandleSignalingPeer(sp *signaling.Peer) error {
 				return
 			}
 			if resp != nil {
-				if err := dc.SendText(string(resp)); err != nil {
-					log.Printf("[webrtc] send response: %v", err)
-				}
+				dc.SendText(string(resp))
 			}
 		})
-
-		dc.OnClose(func() {
-			log.Printf("[webrtc] data channel closed")
-		})
+		dc.OnClose(func() { log.Printf("[webrtc] data channel closed") })
 	})
 
 	go p.runSignalingLoop(m)
@@ -239,49 +221,37 @@ func (p *Peer) runSignalingLoop(m *Manager) {
 			Cand json.RawMessage `json:"candidate"`
 		}
 		if err := json.Unmarshal(raw, &env); err != nil {
-			log.Printf("[webrtc] bad signaling msg: %v", err)
 			continue
 		}
 		switch env.Type {
 		case "offer":
 			offer := webrtc.SessionDescription{}
 			if err := json.Unmarshal(env.SDP, &offer); err != nil {
-				log.Printf("[webrtc] bad offer: %v", err)
 				continue
 			}
 			if err := p.pc.SetRemoteDescription(offer); err != nil {
-				log.Printf("[webrtc] set remote description: %v", err)
 				continue
 			}
 			answer, err := p.pc.CreateAnswer(nil)
 			if err != nil {
-				log.Printf("[webrtc] create answer: %v", err)
 				continue
 			}
 			if err := p.pc.SetLocalDescription(answer); err != nil {
-				log.Printf("[webrtc] set local description: %v", err)
 				continue
 			}
 			out, _ := json.Marshal(map[string]interface{}{
-				"type": "answer",
-				"to":   p.signaling.ID,
-				"sdp":  answer,
+				"type": "answer", "to": p.signaling.ID, "sdp": answer,
 			})
 			select {
 			case p.signaling.Send <- out:
 			default:
-				log.Printf("[webrtc] signaling.Send full, dropping answer")
 			}
-
 		case "candidate":
 			c := webrtc.ICECandidateInit{}
 			if err := json.Unmarshal(env.Cand, &c); err != nil {
-				log.Printf("[webrtc] bad candidate: %v", err)
 				continue
 			}
-			if err := p.pc.AddICECandidate(c); err != nil {
-				log.Printf("[webrtc] add ice candidate: %v", err)
-			}
+			p.pc.AddICECandidate(c)
 		}
 	}
 }
@@ -296,14 +266,11 @@ func (p *Peer) Close() {
 	}
 	p.closed = true
 	close(p.inbox)
-	pc := p.pc
-	sig := p.signaling
+	pc, sig := p.pc, p.signaling
 	p.mu.Unlock()
-
 	p.closeAllWSStreams()
-
 	if pc != nil {
-		_ = pc.Close()
+		pc.Close()
 	}
 	if sig != nil {
 		sig.Close()
@@ -320,8 +287,6 @@ func (p *Peer) SendDC(data []byte) {
 		dc.SendText(string(data))
 	}
 }
-
-// --- WebSocket stream multiplexing ---
 
 func (p *Peer) RegisterWSStream(id string, conn *websocket.Conn) {
 	p.wsMu.Lock()
