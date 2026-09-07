@@ -25,13 +25,26 @@ self.addEventListener('message', (event) => {
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
 
+// Files that are NEVER tunneled — always served directly by the gateway.
+const SKIP = new Set([
+    '/', '/index.html',
+    '/_signal',
+    '/p2p-sw.js',
+    '/client.js',
+]);
+
 self.addEventListener('fetch', (event) => {
     const req = event.request;
     const url = new URL(req.url);
 
-    const skip = new Set(['/_signal', '/p2p-sw.js', '/client.js']);
-    if (skip.has(url.pathname)) {
+    // Never tunnel gateway's own files.
+    if (SKIP.has(url.pathname)) {
         return;
+    }
+
+    // If DataChannel is not open, fall back to direct fetch immediately.
+    if (!dcReady) {
+        return; // browser default — no interception
     }
 
     // Check if this is a WebSocket upgrade request
@@ -52,6 +65,7 @@ async function forward(req) {
             console.warn('[p2p-sw] tunnel failed, falling back', e);
         }
     }
+    // Fallback: regular fetch against the gateway's reverse-proxy path.
     const directURL = new URL('/upstream' + new URL(req.url).pathname + new URL(req.url).search, location.origin);
     return fetch(directURL.toString(), {
         method: req.method,
@@ -62,9 +76,6 @@ async function forward(req) {
 }
 
 // wsTunnel bridges a browser-side WebSocket to the upstream via DataChannel.
-// Since Service Workers can't create WebSocket servers, we use a
-// MessageChannel to relay ws-data/ws-close messages to the page,
-// which writes them to the DataChannel.
 function wsTunnel(req) {
     if (!dcReady) {
         return new Response(null, { status: 503, statusText: 'DataChannel not open' });
@@ -74,11 +85,9 @@ function wsTunnel(req) {
     const id = nextID();
     const ch = new MessageChannel();
 
-    // Build headers object
     const headers = {};
     req.headers.forEach((v, k) => { headers[k] = v; });
 
-    // Send ws-open to the page
     const openFrame = {
         type: 'tunnel',
         payload: {
@@ -89,15 +98,6 @@ function wsTunnel(req) {
         }
     };
 
-    // We can't actually create a real WebSocket from a Service Worker
-    // for server-initiated messages. Instead, we create a fake Response
-    // that acts as a duplex stream. The page will use the MessagePort
-    // to relay ws-data and ws-close messages.
-    //
-    // For simplicity, we return a 101 Switching Protocols response
-    // body that the page handles via the port.
-
-    // Send the open request to the page and wait for ok/err
     return new Promise((resolve) => {
         const timer = setTimeout(() => {
             ch.port1.close();
@@ -108,18 +108,6 @@ function wsTunnel(req) {
             const msg = event.data || {};
             if (msg.type === 'ws-open-ok') {
                 clearTimeout(timer);
-                // Build a fake 101 response. The real WebSocket is
-                // on the page side; we return a dummy response so the
-                // browser doesn't error.
-                //
-                // In practice, the page-side WebSocket API will handle
-                // the actual connection. This code path is for the
-                // Service Worker to coordinate the tunnel setup.
-                //
-                // NOTE: Browsers don't let SWs create WebSocket servers,
-                // so the actual WS upgrade happens at the page level.
-                // The SW's role is limited to HTTP tunneling.
-                // For WS, the page must handle the connection directly.
                 resolve(new Response(null, {
                     status: 101,
                     statusText: 'Switching Protocols',
@@ -132,7 +120,6 @@ function wsTunnel(req) {
             }
         };
 
-        // Post to page
         self.clients.matchAll({ includeUncontrolled: true, type: 'window' })
             .then(cls => {
                 if (!cls.length) {
