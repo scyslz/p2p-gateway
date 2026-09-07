@@ -8,51 +8,87 @@
       window.__GATEWAY_CONFIG__ = /*__P2P_CONFIG__*/null;
     </script>
   <style>
-      body { font-family: -apple-system, system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 20px; background: #fafafa; }
-      h1 { font-size: 24px; }
-      .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #eee; }
+      body { font-family: -apple-system, system-ui, sans-serif; max-width: 720px; margin: 20px auto; padding: 0 16px; background: #fafafa; }
+      h1 { font-size: 20px; margin-bottom: 8px; }
+      h2 { font-size: 16px; margin: 16px 0 8px; }
+      .row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #eee; font-size: 13px; }
       .row .lbl { color: #666; }
-      .row .val { font-family: ui-monospace, SFMono-Regular, monospace; }
+      .row .val { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; }
       .ok { color: #2e7d32; font-weight: 600; }
       .bad { color: #c62828; font-weight: 600; }
-      .warn { color: #e65100; font-weight: 600; }
-      button { padding: 8px 14px; margin-top: 12px; cursor: pointer; }
-      pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow-x: auto; }
-      .target-bar { display: flex; gap: 8px; margin: 16px 0; }
-      .target-bar input { flex: 1; padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+      button { padding: 6px 12px; cursor: pointer; font-size: 13px; }
+      .target-bar { display: flex; gap: 6px; margin: 10px 0; }
+      .target-bar input { flex: 1; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
       .target-bar button { white-space: nowrap; }
-      #loading-bar { height: 3px; background: #1976d2; width: 0%; transition: width 0.3s; margin: 12px 0; border-radius: 2px; }
-      #loading-bar.active { animation: load 2s ease-in-out infinite; }
-      @keyframes load { 0%{width:0%} 50%{width:80%} 100%{width:100%} }
-      #error-box { display: none; background: #fff3e0; border: 1px solid #ff9800; border-radius: 6px; padding: 12px; margin: 12px 0; color: #e65100; }
+
+      /* Log panel */
+      #log-panel { background: #1e1e1e; color: #d4d4d4; border-radius: 6px; padding: 8px 10px; margin: 10px 0; max-height: 320px; overflow-y: auto; font-family: 'Cascadia Code', 'Fira Code', ui-monospace, monospace; font-size: 11px; line-height: 1.5; }
+      .log-entry { white-space: pre-wrap; word-break: break-all; }
+      .log-time { color: #666; }
+      .log-info { color: #9cdcfe; }
+      .log-ok { color: #6a9955; }
+      .log-warn { color: #dcdcaa; }
+      .log-err { color: #f44747; }
+      .log-signal { color: #c586c0; }
+      .log-ice { color: #4ec9b0; }
+      .log-dc { color: #ce9178; }
+      .log-tunnel { color: #b5cea8; }
+      #log-controls { display: flex; gap: 6px; margin-bottom: 4px; }
+      #log-controls button { font-size: 11px; padding: 2px 8px; background: #333; color: #ccc; border: 1px solid #555; border-radius: 3px; }
+      #log-controls button:hover { background: #444; }
   </style>
 </head>
 <body>
   <h1>⚡ P2P Gateway</h1>
 
-  <div id="error-box"></div>
-  <div id="loading-bar" class="active"></div>
-
   <div class="target-bar">
-    <input id="targetInput" type="text" placeholder="http://127.0.0.1:3000 or ws://127.0.0.1:8080" />
+    <input id="targetInput" type="text" placeholder="http://127.0.0.1:3000 or 192.168.1.100:3000" />
     <button id="applyTarget">🔗 Connect</button>
   </div>
 
   <div class="row"><span class="lbl">Target</span><span class="val" id="target">…</span></div>
   <div class="row"><span class="lbl">Gateway</span><span class="val" id="host">…</span></div>
-  <div class="row"><span class="lbl">Service Worker</span><span class="val" id="sw">…</span></div>
+  <div class="row"><span class="lbl">SW</span><span class="val" id="sw">…</span></div>
   <div class="row"><span class="lbl">Signaling</span><span class="val" id="signal">…</span></div>
   <div class="row"><span class="lbl">STUN</span><span class="val" id="stun">…</span></div>
   <div class="row"><span class="lbl">ICE</span><span class="val" id="ice">…</span></div>
   <div class="row"><span class="lbl">DataChannel</span><span class="val" id="dc">…</span></div>
-  <div class="row"><span class="lbl">Status</span><span class="val" id="status">⏳ Initializing</span></div>
+  <div class="row"><span class="lbl">Status</span><span class="val" id="status">⏳ Init</span></div>
 
-  <h2>Test request</h2>
-  <button id="btn">Fetch / via P2P tunnel</button>
-  <pre id="out">(click the button to test)</pre>
+  <h2>📡 P2P Tunnel Log</h2>
+  <div id="log-controls">
+    <button onclick="clearLog()">Clear</button>
+    <button onclick="toggleAutoScroll()">Auto-scroll: ON</button>
+  </div>
+  <div id="log-panel"></div>
+
+  <h2>Test</h2>
+  <button id="btn">Fetch / via tunnel</button>
+  <pre id="out" style="font-size:11px;max-height:200px;overflow:auto">(click to test)</pre>
 
   <script>
-    // Apply target: reload page with ?target=<url>
+    // --- Log system ---
+    let autoScroll = true;
+    const logEl = document.getElementById('log-panel');
+    const COLORS = { info: 'log-info', ok: 'log-ok', warn: 'log-warn', err: 'log-err', signal: 'log-signal', ice: 'log-ice', dc: 'log-dc', tunnel: 'log-tunnel' };
+
+    window.log = function(level, tag, msg) {
+      const t = new Date().toLocaleTimeString('en-GB', {hour12:false});
+      const cls = COLORS[level] || 'log-info';
+      const entry = document.createElement('div');
+      entry.className = 'log-entry';
+      entry.innerHTML = '<span class="log-time">' + t + '</span> <span class="' + cls + '">[' + tag + ']</span> ' + msg;
+      logEl.appendChild(entry);
+      if (autoScroll) logEl.scrollTop = logEl.scrollHeight;
+    };
+
+    window.clearLog = function() { logEl.innerHTML = ''; };
+    window.toggleAutoScroll = function() {
+      autoScroll = !autoScroll;
+      document.querySelector('#log-controls button:last-child').textContent = 'Auto-scroll: ' + (autoScroll ? 'ON' : 'OFF');
+    };
+
+    // --- Apply target ---
     document.getElementById('applyTarget').addEventListener('click', () => {
       const t = document.getElementById('targetInput').value.trim();
       if (!t) return;
@@ -60,15 +96,11 @@
       u.searchParams.set('target', t);
       location.href = u.toString();
     });
-    // Pre-fill from current URL param
     const cur = new URLSearchParams(location.search).get('target');
     if (cur) document.getElementById('targetInput').value = cur;
 
-    // Show error in box
     window.__showError = function(msg) {
-      const box = document.getElementById('error-box');
-      box.textContent = '⚠️ ' + msg;
-      box.style.display = 'block';
+      log('err', 'ERROR', msg);
     };
   </script>
   <script src="/client.js"></script>
