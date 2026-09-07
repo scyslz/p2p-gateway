@@ -152,6 +152,10 @@ func main() {
 
 	// Static bootstrap files.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Bypass browser cache — force fresh load.
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
 		serveStatic(w, r)
 	})
 
