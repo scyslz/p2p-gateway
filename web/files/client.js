@@ -11,6 +11,7 @@
     let pendingTarget = '';
     let userTriggeredConnect = false;
     let autoNavDone = false;
+    let pendingNavWindow = null;
     const sessGet = (k) => { try { return sessionStorage.getItem(k) || ''; } catch(e) { return ''; } };
     const sessSet = (k,v) => { try { sessionStorage.setItem(k,v); } catch(e) {} };
     const sessRemove = (k) => { try { sessionStorage.removeItem(k); } catch(e) {} };
@@ -37,37 +38,52 @@
             return new URLSearchParams(location.search).get('target') || '';
         }
     }
-    async function probeAndMaybeRedirect() {
+    async function probeAndMaybeRedirect(force) {
         if (autoNavDone) return;
         const t = resolvePageTarget() || pageTargetCache || (cfg.target || '');
-        if (!t) return;
+        if (!t) { if (force && pendingNavWindow) { try { pendingNavWindow.document.body.innerHTML = '<p style="font:14px monospace;padding:20px;color:#c00">No target</p>'; } catch(e) {} } return; }
         const hasParam = new URLSearchParams(location.search).has('target');
-        if (!hasParam && !userTriggeredConnect) return;
+        if (!hasParam && !userTriggeredConnect && !force) return;
         if (location.pathname !== '/p2p/' && location.pathname !== '/p2p') return;
-        if (sessGet('p2p-auto-nav') !== 'on') return;
+        if (!force && sessGet('p2p-auto-nav') !== 'on') return;
+        if (force && pendingNavWindow && pendingNavWindow.closed) pendingNavWindow = null;
+        let probeStatus = 0; let probeOk = false;
         try {
             const r = await fetch('/?__p2p_probe=' + Date.now(), { cache: 'no-store' });
-            if (!r.ok) return;
-        } catch(e) { return; }
-        autoNavDone = true;
-        const mode = sessGet('p2p-redirect-mode') || 'newtab';
-        const url = '/?target=' + encodeURIComponent(t);
-        if (mode === 'newtab') {
-            const w = window.open(url, '_blank');
-            if (!w) {
-                L('warn','NAV','popup blocked — keep /p2p/ alive and open '+url+' manually');
-                const a = document.createElement('a');
-                a.href = url; a.textContent = '→ Open target (popup blocked)'; a.target = '_blank';
-                a.style.cssText = 'display:block;margin:8px 0;color:#06c';
-                document.body.prepend(a);
-                return;
+            probeStatus = r.status;
+            probeOk = r.status !== 502 && r.status !== 503 && r.status !== 504;
+        } catch(e) { probeOk = false; }
+        if (!probeOk) {
+            if (force && pendingNavWindow && !pendingNavWindow.closed) {
+                try { pendingNavWindow.document.body.innerHTML = '<p style="font:14px monospace;padding:20px">Tunnel probe failed (status '+probeStatus+') — <a href="/?target='+encodeURIComponent(t)+'">click to open anyway</a> (keep this tab open)</p>'; } catch(e) {}
+                L('warn','NAV','probe failed status='+probeStatus+' — keep window, manual link shown');
             }
-            L('ok','NAV','probe 200 — opened target in new tab (keep this /p2p/ tab alive)');
-        } else {
-            L('warn','NAV','same-tab redirect would unload P2P host and break tunnel — opening new tab instead; keep this tab open');
-            const w = window.open(url, '_blank');
-            if (!w) location.href = url;
+            if (!force) return;
+            if (force && pendingNavWindow) {
+                const url = '/?target=' + encodeURIComponent(t);
+                try { pendingNavWindow.location.href = url; L('ok','NAV','probe fail but force-navigating to target'); } catch(e) {}
+                autoNavDone = true; pendingNavWindow = null; return;
+            }
+            return;
         }
+        autoNavDone = true;
+        const url = '/?target=' + encodeURIComponent(t);
+        if (force && pendingNavWindow && !pendingNavWindow.closed) {
+            try { pendingNavWindow.location.href = url; } catch(e) { const w = window.open(url, '_blank'); if (!w) showPopupFallback(url); else pendingNavWindow = w; }
+            L('ok','NAV','probe '+probeStatus+' — navigating to target');
+            pendingNavWindow = null;
+            return;
+        }
+        const w = window.open(url, '_blank');
+        if (!w) { showPopupFallback(url); return; }
+        L('ok','NAV','probe '+probeStatus+' — opened target in new tab (keep this /p2p/ tab alive)');
+    }
+    function showPopupFallback(url) {
+        L('warn','NAV','popup blocked — keep /p2p/ alive and open '+url+' manually');
+        const a = document.createElement('a');
+        a.href = url; a.textContent = '→ Open target (popup blocked)'; a.target = '_blank';
+        a.style.cssText = 'display:block;margin:8px 0;color:#06c';
+        document.body.prepend(a);
     }
 
     let pageTargetCache = '';
@@ -271,8 +287,8 @@
                 const bar = document.getElementById('loading-bar');
                 if (bar) { bar.classList.remove('active'); bar.style.width = '100%'; }
                 notifySW(true);
-                L('info', 'NAV', 'Tunnel ready — use Test or browse, target stays bound');
-                try { probeAndMaybeRedirect(); } catch(e) {}
+                L('info', 'NAV', 'Tunnel ready — ' + (pendingNavWindow ? 'opening target...' : 'use Test or browse, target stays bound'));
+                try { if (pendingNavWindow) probeAndMaybeRedirect(true); else probeAndMaybeRedirect(); } catch(e) {}
                 try { dc.send(JSON.stringify({ type: 'ready', ts: Date.now() })); DIAG('ok', 'DC', '→ ready'); } catch(e) { DIAG('err','DC','ready send err '+e.message); }
                 setTimeout(() => { if (!ackSeen) DIAG('warn','DC','ready-ack not seen in 2s, gateway may be old binary'); }, 2000);
                 if (kaTimer) clearInterval(kaTimer);
@@ -514,16 +530,24 @@
         }
         userTriggeredConnect = true; autoNavDone = false;
         try {
-            sessSet(LS_KEY, t);
-            const hist = [t].concat(loadHistory().filter((x) => x !== t)).slice(0, 8);
-            localStorage.setItem(LS_HIST, JSON.stringify(hist));
-        } catch (e) {}
-        try {
             const u = new URL(location.href);
             u.searchParams.set('target', t);
             history.replaceState(null, '', u.toString());
         } catch (e) {}
         pendingTarget = t;
+        try {
+            const w = window.open('about:blank', '_blank');
+            if (w) {
+                try { w.document.title = 'Connecting ' + t; w.document.body.innerHTML = '<p style="font:14px monospace;padding:20px">Connecting to ' + escapeHtml(t) + ' — probing tunnel...</p>'; } catch(e2) {}
+                if (pendingNavWindow && !pendingNavWindow.closed) { try { pendingNavWindow.close(); } catch(e2) {} }
+                pendingNavWindow = w;
+            }
+        } catch(e) {}
+        try {
+            sessSet(LS_KEY, t);
+            const hist = [t].concat(loadHistory().filter((x) => x !== t)).slice(0, 8);
+            localStorage.setItem(LS_HIST, JSON.stringify(hist));
+        } catch (e) {}
         renderHistory();
         const input = document.getElementById('targetInput');
         if (input) {
@@ -538,7 +562,12 @@
                         ws.send(JSON.stringify({ type: 'target', target: t }));
                         pendingTarget = '';
                         L('info', 'TARGET', 'hot-swapped to ' + t + ' (no ICE rebuild)');
-                        if (dc && dc.readyState === 'open') setStatus('✅ Ready', true);
+                        if (dc && dc.readyState === 'open') {
+                            setStatus('✅ Ready', true);
+                            setTimeout(() => { try { probeAndMaybeRedirect(true); } catch(e) {} }, 400);
+                        } else {
+                            L('info', 'NAV', 'Target switched — waiting for tunnel to open new tab');
+                        }
                     } catch (e2) {}
                 };
                 if (ws.readyState === WebSocket.OPEN) doSend();
