@@ -87,9 +87,12 @@ func loadConfig(path string) (*Config, error) {
 		c.Scheme = "http"
 	}
 	// CLI --target flag overrides config file.
+	// Supports both "--target <url>" and "--target=<url>".
 	for i, arg := range os.Args[1:] {
-		if arg == "--target" && i+2 < len(os.Args) {
+		if arg == "--target" && i+2 <= len(os.Args)-1 {
 			c.Target = os.Args[i+2]
+		} else if strings.HasPrefix(arg, "--target=") {
+			c.Target = strings.TrimPrefix(arg, "--target=")
 		}
 	}
 	return &c, nil
@@ -179,6 +182,17 @@ func main() {
 	// Root path and all non-/p2p/ paths are Target resources.
 	// Service Worker intercepts browser requests and tunnels them
 	// through WebRTC DataChannel. The Gateway proxies to the target.
+	//
+	// /upstream/ reverse-proxy fallback: used by the SW when the
+	// DataChannel is down, by non-SW browsers (plain http has no SW),
+	// and by non-browser clients (curl). Target resolution is the same
+	// as signaling (?target= > global Target > host).
+	mux.HandleFunc("/upstream/", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "fallback disabled (P2P-only mode)", http.StatusServiceUnavailable)
+	})
+	mux.HandleFunc("/upstream", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "fallback disabled (P2P-only mode)", http.StatusServiceUnavailable)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// /p2p/* handled above; this is target proxy fallback.
 		serveStatic(w, r)
@@ -328,6 +342,18 @@ func handleDirect(resolver *routing.Resolver, w http.ResponseWriter, r *http.Req
 		http.Error(w, "no target resolved", http.StatusBadRequest)
 		return
 	}
+	// Loop guard: never proxy back into ourselves (e.g. host-direct
+	// resolution behind a reverse proxy that preserves the public Host).
+	if tu, err := url.Parse(target); err == nil {
+		reqHost := r.Host
+		if i := strings.IndexByte(reqHost, ':'); i >= 0 {
+			reqHost = reqHost[:i]
+		}
+		if strings.EqualFold(tu.Hostname(), reqHost) {
+			http.Error(w, "loop detected: target resolves to this gateway, specify ?target=", http.StatusBadRequest)
+			return
+		}
+	}
 
 	path := r.URL.Path
 	if strings.HasPrefix(path, "/upstream") {
@@ -340,7 +366,15 @@ func handleDirect(resolver *routing.Resolver, w http.ResponseWriter, r *http.Req
 	u, _ := url.Parse(target)
 	rel, _ := url.Parse(path)
 	u.Path = singleSlash(u.Path, rel.Path)
-	u.RawQuery = r.URL.RawQuery
+	// `target` is a gateway routing param: consume it here instead of
+	// leaking it to the upstream query string.
+	if r.URL.Query().Get("target") != "" {
+		q := r.URL.Query()
+		q.Del("target")
+		u.RawQuery = q.Encode()
+	} else {
+		u.RawQuery = r.URL.RawQuery
+	}
 
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, u.String(), r.Body)
 	if err != nil {
@@ -465,6 +499,11 @@ func serveStatic(w http.ResponseWriter, r *http.Request) {
 		b = []byte(page)
 	}
 
+	// Control-plane UI must never be cached: a stale client.js/index.html
+	// silently disables new behavior (hot-switch, SW-less boot, ...).
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	switch {
 	case strings.HasSuffix(path, ".html"):
 		w.Header().Set("content-type", "text/html; charset=utf-8")

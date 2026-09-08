@@ -1,4 +1,4 @@
-listen_addr: ":8080"
+listen_addr: ":62057"
 tls_cert: ""
 tls_key: ""
 base_domain: "localhost"
@@ -6,3 +6,4 @@ prefix: "p2p-"
 stun_url: "stun:stun.miwifi.com:3478"
 turn_url: "turn:vibeshine_06069737:yljpA3mE3xArjnTbwegTyD@dd.asher.kdns.fr:3478?transport=udp"
 scheme: "http"
+# target: "http://127.0.0.1:3000"  # uncomment to set a fixed upstream

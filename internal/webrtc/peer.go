@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v3"
@@ -96,6 +97,10 @@ func (m *Manager) HandleSignalingPeer(sp *signaling.Peer) error {
 
 	dc.OnOpen(func() {
 		log.Printf("[webrtc] DataChannel %q opened for peer %s", dc.Label(), sp.ID)
+		if b, _ := json.Marshal(map[string]interface{}{"type": "ready", "ts": time.Now().UnixMilli()}); b != nil {
+			p.SendDC(b)
+		}
+		go p.keepaliveLoop()
 	})
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		p.handleDCMessage(msg)
@@ -172,14 +177,27 @@ func (p *Peer) runGatewaySignalingLoop(m *Manager) {
 
 	for raw := range p.inbox {
 		var env struct {
-			Type string          `json:"type"`
-			SDP  json.RawMessage `json:"sdp"`
-			Cand json.RawMessage `json:"candidate"`
+			Type   string          `json:"type"`
+			SDP    json.RawMessage `json:"sdp"`
+			Cand   json.RawMessage `json:"candidate"`
+			Target string          `json:"target"`
 		}
 		if err := json.Unmarshal(raw, &env); err != nil {
 			continue
 		}
 		switch env.Type {
+		case "target":
+			// Live target switch: no ICE rebuild needed, the same
+			// DataChannel keeps serving with the new upstream.
+			t := strings.TrimSpace(env.Target)
+			if t != "" {
+				if !strings.Contains(t, "://") {
+					t = "http://" + t
+				}
+				p.SetTarget(t)
+				log.Printf("[webrtc] peer %s switched target to %s", p.signaling.ID, t)
+			}
+			continue
 		case "answer":
 			log.Printf("[webrtc] received answer from browser %s", p.signaling.ID)
 			answer := webrtc.SessionDescription{}
@@ -230,7 +248,26 @@ func (p *Peer) SendDC(data []byte) {
 	dc := p.dc
 	p.mu.Unlock()
 	if dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen {
-		dc.Send(data)
+		_ = dc.SendText(string(data))
+	}
+}
+
+func (p *Peer) keepaliveLoop() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		p.mu.Lock()
+		closed := p.closed
+		dc := p.dc
+		p.mu.Unlock()
+		if closed || dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
+			return
+		}
+		ping, _ := json.Marshal(map[string]interface{}{"type": "ping", "ts": time.Now().UnixMilli()})
+		if err := dc.Send(ping); err != nil {
+			log.Printf("[webrtc] keepalive ping failed for %s: %v", p.signaling.ID, err)
+			return
+		}
 	}
 }
 
@@ -244,6 +281,24 @@ func (p *Peer) handleDCMessage(msg webrtc.DataChannelMessage) {
 		return
 	}
 	switch envelope.Type {
+	case "ping":
+		log.Printf("[webrtc] ping from peer %s → pong", p.signaling.ID)
+		pong, _ := json.Marshal(map[string]interface{}{"type": "pong", "ts": time.Now().UnixMilli()})
+		p.SendDC(pong)
+		log.Printf("[webrtc] pong sent to peer %s", p.signaling.ID)
+		return
+	case "pong":
+		log.Printf("[webrtc] pong from peer %s", p.signaling.ID)
+		return
+	case "ready":
+		if b, _ := json.Marshal(map[string]interface{}{"type": "ready-ack", "ts": time.Now().UnixMilli()}); b != nil {
+			p.SendDC(b)
+		}
+		log.Printf("[webrtc] ready↔ack with peer %s", p.signaling.ID)
+		return
+	case "ready-ack":
+		log.Printf("[webrtc] ready-ack from peer %s", p.signaling.ID)
+		return
 	case "request":
 		if p.onReq != nil {
 			resp, err := p.onReq(p, raw)

@@ -69,6 +69,11 @@ func Handler(target string) wrtc.RequestHandler {
 					BodyB64: base64.StdEncoding.EncodeToString([]byte("gateway error: " + err.Error())),
 				})
 			}
+			if len(resp.BodyB64) > 60000 {
+				log.Printf("[proxy] chunked %dB body id=%s chunks=%d", len(resp.BodyB64), resp.ID, (len(resp.BodyB64)+59999)/60000)
+				sendChunked(p, resp)
+				return nil, nil
+			}
 			return json.Marshal(resp)
 
 		case "ws-open":
@@ -322,19 +327,9 @@ func forwardHTTP(client *http.Client, target string, in *Request) (*Response, er
 		out.Headers[k] = strings.Join(vs, ", ")
 	}
 
-	// Inject <base> tag for HTML responses so relative URLs resolve to upstream.
 	ct := lastResp.Header.Get("Content-Type")
 	if strings.Contains(ct, "text/html") {
-		baseTag := `<base href="` + target + `">`
-		html := string(body)
-		if strings.Contains(html, "<head") {
-			html = strings.Replace(html, "<head", "<head>"+baseTag, 1)
-		} else if strings.Contains(html, "<HEAD") {
-			html = strings.Replace(html, "<HEAD", "<HEAD>"+baseTag, 1)
-		} else {
-			html = baseTag + html
-		}
-		out.BodyB64 = base64.StdEncoding.EncodeToString([]byte(html))
+		_ = ct
 	}
 
 	return out, nil
@@ -451,6 +446,46 @@ func singleSlash(a, b string) string {
 	default:
 		return a + b
 	}
+}
+
+func sendChunked(p *wrtc.Peer, resp *Response) {
+	const chunkSize = 16384
+	b64 := resp.BodyB64
+	total := (len(b64) + chunkSize - 1) / chunkSize
+	log.Printf("[proxy] chunked meta id=%s ct=%q chunks=%d", resp.ID, resp.Headers["Content-Type"], total)
+	ct := resp.Headers["Content-Type"]
+	if ct == "" {
+		ct = resp.Headers["content-type"]
+	}
+	if ct == "" {
+		for k, v := range resp.Headers {
+			if strings.EqualFold(k, "content-type") {
+				ct = v
+				break
+			}
+		}
+	}
+	if ct == "" {
+		log.Printf("[proxy] WARN empty content-type id=%s headers=%v", resp.ID, resp.Headers)
+	}
+	meta, _ := json.Marshal(map[string]interface{}{
+		"type": "response-start", "id": resp.ID, "status": resp.Status,
+		"headers": resp.Headers, "chunks": total, "totalLen": len(b64),
+	})
+	p.SendDC(meta)
+	for i := 0; i < total; i++ {
+		end := i*chunkSize + chunkSize
+		if end > len(b64) {
+			end = len(b64)
+		}
+		chunk, _ := json.Marshal(map[string]interface{}{
+			"type": "response-chunk", "id": resp.ID, "idx": i, "data": b64[i*chunkSize : end],
+		})
+		p.SendDC(chunk)
+	}
+	end, _ := json.Marshal(map[string]interface{}{"type": "response-end", "id": resp.ID})
+	p.SendDC(end)
+	log.Printf("[proxy] chunked done id=%s chunks=%d", resp.ID, total)
 }
 
 func errorResponse(id string, status int, msg string) *Response {

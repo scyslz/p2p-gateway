@@ -15,17 +15,31 @@
 'use strict';
 
 let dcReady = false;
+let dcClientId = '';
+let pageTarget = '';
+const readyByClient = new Map();
+const targetByClient = new Map();
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (event) => {
     event.waitUntil(self.clients.claim());
 });
 self.addEventListener('message', (event) => {
     const msg = event.data || {};
+    const src = event.source && event.source.id || '';
+    console.log('[p2p-sw] msg ' + msg.type + ' open=' + msg.open + ' target=' + msg.target + ' from=' + src);
     if (msg.type === 'dc-state') {
         dcReady = !!msg.open;
-        if (dcReady && msg.target) {
-            // Store target for reconnect after refresh
-            try { localStorage.setItem('p2p-target', msg.target); } catch(e) {}
+        if (src) { dcClientId = src; if (msg.open) readyByClient.set(src, true); else readyByClient.delete(src); }
+        console.log('[p2p-sw] dcReady=' + dcReady + ' target=' + msg.target + ' dcClientId=' + dcClientId);
+        if (typeof msg.target === 'string' && msg.target) {
+            pageTarget = msg.target;
+            if (src) targetByClient.set(src, msg.target);
+        }
+    } else if (msg.type === 'target') {
+        if (typeof msg.target === 'string' && msg.target) {
+            pageTarget = msg.target;
+            if (src) targetByClient.set(src, msg.target);
+            console.log('[p2p-sw] pageTarget=' + pageTarget);
         }
     }
     if (msg.type === 'skip-waiting') {
@@ -34,72 +48,104 @@ self.addEventListener('message', (event) => {
 });
 
 // Files that are NEVER tunneled — always served directly by the gateway.
+// Covers both the current /p2p/* control plane and legacy paths.
 const SKIP = new Set([
     '/_signal',
+    '/signal',
+    '/p2p/signal',
     '/p2p-sw.js',
+    '/p2p/sw.js',
     '/client.js',
     '/index.html',
+    '/p2p/',
+    '/p2p/status',
+    '/upstream',
 ]);
 
 self.addEventListener('fetch', (event) => {
     const req = event.request;
     const url = new URL(req.url);
 
-    // Never tunnel gateway's own files.
-    if (SKIP.has(url.pathname)) {
+    if (SKIP.has(url.pathname) || url.pathname === '/upstream/' || url.pathname.startsWith('/upstream/')) {
         return;
     }
 
-    // If DataChannel is not open, check if we have a stored target
+    const clientId = event.clientId || event.resultingClientId || '';
+    const myTarget = (clientId && targetByClient.get(clientId)) || pageTarget || '';
+
     if (!dcReady) {
-        try {
-            const storedTarget = localStorage.getItem('p2p-target');
-            if (storedTarget && url.pathname === '/' && !url.searchParams.has('target')) {
-                // Redirect to setup page with stored target
-                return new Response(null, {
-                    status: 302,
-                    headers: { 'Location': '/?target=' + encodeURIComponent(storedTarget) }
-                });
-            }
-        } catch(e) {}
-        return; // browser default — no interception
+        if (myTarget && url.pathname === '/' && !url.searchParams.has('target')) {
+            event.respondWith(new Response(null, {
+                status: 302,
+                headers: { 'Location': '/?target=' + encodeURIComponent(myTarget) }
+            }));
+            return;
+        }
+        return;
     }
 
-    // Check if this is a WebSocket upgrade request
     const upgradeHeader = req.headers.get('upgrade');
     if (upgradeHeader && upgradeHeader.toLowerCase() === 'websocket') {
-        event.respondWith(wsTunnel(req));
+        event.respondWith(wsTunnel(req, clientId));
         return;
     }
 
-    event.respondWith(forward(req));
+    event.respondWith(forward(req, clientId));
 });
 
-async function forward(req) {
+async function forward(req, clientId) {
     const url = new URL(req.url);
-    if (dcReady) {
-        try {
-            return await p2pFetch(req);
-        } catch (e) {
-            console.warn('[p2p-sw] tunnel failed, falling back', e);
+    if (!dcReady) {
+        console.log('[p2p-sw] wait dcReady for ' + url.pathname);
+        for (let i=0; i<15; i++) {
+            await new Promise(r=>setTimeout(r,200));
+            if (dcReady) break;
+        }
+        if (!dcReady) {
+            console.warn('[p2p-sw] tunnel not ready after wait ' + url.pathname);
+            return new Response('Tunnel not ready (no fallback)', { status: 503, statusText: 'Tunnel not ready' });
         }
     }
-    // Fallback: regular fetch against the gateway's reverse-proxy path.
-    const fallbackUrl = new URL('/upstream' + url.pathname + url.search, location.origin);
+    console.log('[p2p-sw] forward via tunnel ' + url.pathname + url.search + ' clientId=' + (clientId||'') + ' dcClientId=' + dcClientId);
+    const t0 = Date.now();
     try {
-        const storedTarget = localStorage.getItem('p2p-target');
-        if (storedTarget) fallbackUrl.searchParams.set('target', storedTarget);
-    } catch(e) {}
-    return fetch(fallbackUrl.toString(), {
-        method: req.method,
-        headers: req.headers,
-        body: req.method === 'GET' || req.method === 'HEAD' ? undefined : await req.clone().arrayBuffer(),
-        redirect: 'manual'
-    });
+        const r = await p2pFetch(req, clientId);
+        console.log('[p2p-sw] tunnel ok ' + url.pathname + ' ' + (Date.now()-t0) + 'ms status=' + r.status);
+        return r;
+    } catch (e) {
+        console.warn('[p2p-sw] tunnel failed ' + url.pathname + ' ' + e.message + ' ' + (Date.now()-t0) + 'ms');
+        return new Response('Tunnel failed: ' + e.message, { status: 502, statusText: 'Tunnel failed' });
+    }
+}
+
+async function pickClient(clientId, id) {
+    if (dcClientId) {
+        try {
+            const c = await self.clients.get(dcClientId);
+            if (c) {
+                console.log('[p2p-sw] pick by dcClientId id=' + id);
+                return c;
+            } else {
+                console.warn('[p2p-sw] dcClientId gone id=' + id);
+            }
+        } catch(e) { console.warn('[p2p-sw] get dcClientId fail ' + e.message); }
+    }
+    if (clientId) {
+        try {
+            const c = await self.clients.get(clientId);
+            if (c) {
+                console.log('[p2p-sw] pick by event.clientId id=' + id);
+                return c;
+            }
+        } catch(e) {}
+    }
+    const cls = await self.clients.matchAll({ includeUncontrolled: true, type: 'window' });
+    console.log('[p2p-sw] pick fallback clients=' + cls.length + ' id=' + id);
+    return cls[0] || null;
 }
 
 // wsTunnel bridges a browser-side WebSocket to the upstream via DataChannel.
-function wsTunnel(req) {
+function wsTunnel(req, clientId) {
     if (!dcReady) {
         return new Response(null, { status: 503, statusText: 'DataChannel not open' });
     }
@@ -143,17 +189,19 @@ function wsTunnel(req) {
             }
         };
 
-        self.clients.matchAll({ includeUncontrolled: true, type: 'window' })
-            .then(cls => {
-                if (!cls.length) {
+        pickClient(clientId, 'ws-'+id).then(client => {
+                if (!client) {
                     clearTimeout(timer);
                     ch.port1.close();
                     resolve(new Response(null, { status: 503, statusText: 'no client' }));
                     return;
                 }
-                cls[0].postMessage(openFrame, [ch.port2]);
-            })
-            .catch(err => {
+                try { client.postMessage(openFrame, [ch.port2]); } catch(e) {
+                    clearTimeout(timer);
+                    ch.port1.close();
+                    resolve(new Response(null, { status: 500, statusText: e.message }));
+                }
+            }).catch(err => {
                 clearTimeout(timer);
                 ch.port1.close();
                 resolve(new Response(null, { status: 500, statusText: err.message }));
@@ -161,26 +209,32 @@ function wsTunnel(req) {
     });
 }
 
-function p2pFetch(req) {
+function p2pFetch(req, clientId) {
     const url = new URL(req.url);
     return new Promise((resolve, reject) => {
         const id = nextID();
         const ch = new MessageChannel();
+        const t0 = Date.now();
+        console.log('[p2p-sw] p2pFetch start id=' + id + ' ' + req.method + ' ' + url.pathname + url.search + ' dcReady=' + dcReady);
 
         const timer = setTimeout(() => {
+            console.warn('[p2p-sw] p2pFetch TIMEOUT id=' + id + ' ' + url.pathname + ' after ' + (Date.now()-t0) + 'ms');
             ch.port1.close();
-            reject(new Error('tunnel timeout'));
-        }, 20000);
+            reject(new Error('tunnel timeout 8s id=' + id));
+        }, 8000);
 
         ch.port1.onmessage = (event) => {
             const msg = event.data || {};
+            console.log('[p2p-sw] p2pFetch onmessage id=' + id + ' type=' + msg.type + ' elapsed=' + (Date.now()-t0) + 'ms');
             if (msg.type === 'response') {
                 clearTimeout(timer);
                 ch.port1.close();
+                console.log('[p2p-sw] p2pFetch resolve id=' + id + ' status=' + msg.status);
                 resolve(buildResponse(msg));
             } else if (msg.type === 'error') {
                 clearTimeout(timer);
                 ch.port1.close();
+                console.warn('[p2p-sw] p2pFetch error id=' + id + ' ' + (msg.error||''));
                 reject(new Error(msg.error || 'tunnel error'));
             }
         };
@@ -189,11 +243,9 @@ function p2pFetch(req) {
         req.headers.forEach((v, k) => { headers[k] = v; });
 
         const send = (bodyB64) => {
-            // Strip /p2p/ prefix — target resources use root paths.
-            // Keep ?target= param so the proxy knows which upstream to use.
             let reqPath = url.pathname;
             if (reqPath.startsWith('/p2p/')) {
-                reqPath = reqPath.substring(4); // strip /p2p → /...
+                reqPath = reqPath.substring(4);
             } else if (reqPath === '/p2p') {
                 reqPath = '/';
             }
@@ -209,15 +261,25 @@ function p2pFetch(req) {
                     body: bodyB64 || ''
                 }
             };
-            self.clients.matchAll({ includeUncontrolled: true, type: 'window' })
-                .then(cls => {
-                    if (!cls.length) {
+            console.log('[p2p-sw] post to client id=' + id + ' ' + frame.payload.method + ' ' + cleanPath + ' clientId=' + (clientId||''));
+            pickClient(clientId, id).then(client => {
+                    if (!client) {
+                        console.warn('[p2p-sw] no client for id=' + id);
                         ch.port1.postMessage({ type: 'error', error: 'no client' });
                         return;
                     }
-                    cls[0].postMessage(frame, [ch.port2]);
+                    try {
+                        client.postMessage(frame, [ch.port2]);
+                        console.log('[p2p-sw] posted to client id=' + id + ' client=' + client.id);
+                    } catch(e) {
+                        console.warn('[p2p-sw] postMessage fail id=' + id + ' ' + e.message);
+                        ch.port1.postMessage({ type: 'error', error: e.message });
+                    }
                 })
-                .catch(err => ch.port1.postMessage({ type: 'error', error: err.message }));
+                .catch(err => {
+                    console.warn('[p2p-sw] pickClient err id=' + id + ' ' + err.message);
+                    ch.port1.postMessage({ type: 'error', error: err.message });
+                });
         };
 
         if (req.method === 'GET' || req.method === 'HEAD') {
