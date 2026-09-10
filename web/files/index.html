@@ -24,6 +24,9 @@
       .hist-row:empty { display: none; }
       .hist-btn { font-size: 12px; padding: 3px 10px; border: 1px solid #bbb; border-radius: 12px; background: #fff; font-family: ui-monospace, monospace; }
       .hist-btn:hover { background: #e8f0fe; border-color: #888; }
+      #applyTarget:disabled { opacity: 0.6; cursor: wait; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .spin { display: inline-block; width: 12px; height: 12px; border: 2px solid #999; border-top-color: #333; border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: -2px; margin-right: 6px; }
 
       /* Log panel */
       #log-panel { background: #1e1e1e; color: #d4d4d4; border-radius: 6px; padding: 8px 10px; margin: 10px 0; max-height: 320px; overflow-y: auto; font-family: 'Cascadia Code', 'Fira Code', ui-monospace, monospace; font-size: 11px; line-height: 1.5; }
@@ -49,11 +52,8 @@
     <input id="targetInput" type="text" placeholder="http://127.0.0.1:3000 or 192.168.1.100:3000" />
     <button id="applyTarget">🔗 Connect</button>
   </div>
-  <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#555;margin:4px 0">
-    <input id="autoNavCheck" type="checkbox" /> P2P连通后自动跳转
-    <select id="navMode" style="font-size:12px"><option value="same">本页</option><option value="newtab">新标签</option></select>
-  </label>
   <div id="targetHistory" class="hist-row" title="recent targets — click to switch"></div>
+  <div id="tunnelList" style="margin:6px 0;display:flex;flex-direction:column;gap:4px"></div>
 
   <div class="row"><span class="lbl">Target</span><span class="val" id="target">…</span></div>
   <div class="row"><span class="lbl">Gateway</span><span class="val" id="host">…</span></div>
@@ -113,24 +113,28 @@
     document.getElementById('targetInput').addEventListener('keydown', (e) => {
       if (e.key === 'Enter') document.getElementById('applyTarget').click();
     });
-    const cur = new URLSearchParams(location.search).get('target');
-    try {
-      const ss = (k)=>{ try{return sessionStorage.getItem(k)||''}catch(e){return ''}};
-      document.getElementById('targetInput').value = cur || ss('p2p-target') || '';
-      const chk = document.getElementById('autoNavCheck');
-      const sel = document.getElementById('navMode');
-      const saved = ss('p2p-auto-nav'); if (chk) chk.checked = saved === 'on';
-      const mode = ss('p2p-redirect-mode'); if (sel && mode) sel.value = mode;
-      if (chk) chk.addEventListener('change', ()=>{ try{sessionStorage.setItem('p2p-auto-nav', chk.checked?'on':'off')}catch(e){}});
-      if (sel) sel.addEventListener('change', ()=>{ try{sessionStorage.setItem('p2p-redirect-mode', sel.value)}catch(e){}});
-    } catch (e) {
-      if (cur) document.getElementById('targetInput').value = cur;
+    function normalizeTarget(raw){
+      if(!raw) return '';
+      raw=String(raw).trim(); if(!raw) return '';
+      try{
+        let s=raw.includes('://')?raw:'http://'+raw;
+        const u=new URL(s);
+        let scheme=u.protocol.slice(0,-1).toLowerCase();
+        if(scheme!=='http'&&scheme!=='https') scheme='http';
+        let host=u.hostname.toLowerCase(); if(!host) return '';
+        let port=u.port;
+        if((scheme==='http'&&port==='80')||(scheme==='https'&&port==='443')) port='';
+        return scheme+'://'+host+(port?':'+port:'');
+      }catch(e){ return ''; }
     }
+    const curRaw = new URLSearchParams(location.search).get('target') || '';
+    const cur = normalizeTarget(curRaw) || curRaw;
+    document.getElementById('targetInput').value = cur || '';
 
     window.__showError = function(msg) {
       log('err', 'ERROR', msg);
     };
   </script>
-  <script src="/client.js"></script>
+  <script src="/client.js?v=v22-fix-includes"></script>
 </body>
 </html>

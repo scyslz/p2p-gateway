@@ -57,8 +57,12 @@ func Handler(target string) wrtc.RequestHandler {
 			if err := json.Unmarshal(raw, &req); err != nil {
 				return nil, fmt.Errorf("decode request: %w", err)
 			}
-			log.Printf("[proxy] %s %s → %s", req.Method, req.Path, target)
-			resp, err := forwardHTTP(client, target, &req)
+			effTarget := target
+			if req.Target != "" {
+				effTarget = req.Target
+			}
+			log.Printf("[proxy] %s %s → %s (peer %s)", req.Method, req.Path, effTarget, target)
+			resp, err := forwardHTTP(client, effTarget, &req)
 			if err != nil {
 				log.Printf("[proxy] forward error: %v", err)
 				return json.Marshal(Response{
@@ -81,7 +85,11 @@ func Handler(target string) wrtc.RequestHandler {
 			if err := json.Unmarshal(raw, &msg); err != nil {
 				return nil, fmt.Errorf("decode ws-open: %w", err)
 			}
-			go handleWSOpen(p, target, &msg)
+			effWSTarget := target
+			if msg.Target != "" {
+				effWSTarget = msg.Target
+			}
+			go handleWSOpen(p, effWSTarget, &msg)
 			return nil, nil
 
 		case "ws-data":
@@ -113,6 +121,7 @@ type Request struct {
 	Path    string            `json:"path"`
 	Headers map[string]string `json:"headers"`
 	BodyB64 string            `json:"body"`
+	Target  string            `json:"target"`
 }
 
 type Response struct {
@@ -128,6 +137,7 @@ type WSOpen struct {
 	ID      string            `json:"id"`
 	Path    string            `json:"path"`
 	Headers map[string]string `json:"headers"`
+	Target  string            `json:"target"`
 }
 
 type WSData struct {

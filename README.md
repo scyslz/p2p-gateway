@@ -2,326 +2,183 @@
 
 A minimal, single-binary **WebRTC application-layer HTTP tunnel**.
 
-The gateway terminates HTTPS on a hostname like `p2p-a.example.com`,
-exchanges SDP/ICE with the browser over a tiny WebSocket signaling
-channel, and forwards every browser request through a WebRTC
-DataChannel to a Go reverse-proxy that talks to the real upstream
-(`https://a.example.com`). The browser address bar **always** stays on
-the gateway host - no redirects, no `Location:` rewrites that escape the
-gateway.
+Browser opens `/p2p/?target=<url>`, establishes WebRTC DataChannel via
+`/p2p/signal`, then Service Worker (`/p2p/sw.js`) tunnels `fetch()` over
+the DataChannel to Go, which proxies to the real upstream. The browser
+address bar stays on the gateway host.
 
 ```
-  browser (https://p2p-a.example.com/)
+  browser /p2p/?target=http://127.0.0.1:3000
         |
-        |  fetch() intercepted by /p2p-sw.js
+        |  fetch() intercepted by /p2p/sw.js
         v
-  Service Worker -- DataChannel "http" --> Go gateway (this repo)
-                                                |
-                                                v
-                                       https://a.example.com
+  Service Worker -- DataChannel --> Go gateway (this repo)
+                                         |
+                                         v
+                                   http://127.0.0.1:3000
 ```
 
-This is an **HTTP tunnel over WebRTC**, not a VPN. Only HTTP/HTTPS
-requests go through; other traffic (DNS, raw TCP, QUIC) does not.
+HTTP tunnel over WebRTC, not a VPN. Only HTTP/HTTPS through DC.
 
-## Status
+## Multi-tunnel (current)
 
-This is the **first working version**. The minimum loop - browser to
-upstream over a DataChannel, with HTTPS fallback when WebRTC fails - is
-operational. The protocol is intentionally tiny: JSON over a text
-DataChannel, with bodies base64-encoded.
+Key = `normalizeTarget(raw)` = `scheme://host[:port]`, lowercased,
+default ports folded (`http:80/https:443` dropped), path/query/hash
+stripped. `http` ≠ `https`. Example:
+
+- `192.168.1.10:3000` → `http://192.168.1.10:3000`
+- `https://Example.com/` → `https://example.com`
+
+State:
+
+- `localStorage p2p-tunnels: {key:{ownerTabId,ts,ready}}` + `p2p-keepers:{tabId:ts}` heartbeat `5s/15s TTL`, `TUNNEL_TTL 30s`
+- `tunnels Map<key,{ws,pc,dc,kaTimer,touchTimer}>`, `TAB_ID=crypto.randomUUID()`, `BroadcastChannel p2p-tunnel-ping`
+- `p2p-targets` history (max 8)
+
+UI (`/p2p/`):
+
+- No auto-jump. Must click **Connect**. Button shows spinner `Connecting…` until `DC open`.
+- `switchTarget(t)`: sync `window.open('about:blank')` placeholder + `ensureTunnel(t)`, ready → reuse placeholder `location.href='/?target=key'`, dedup via `navigatedKeys`.
+- History click = fill input + `switchTarget` (same as Connect).
+- `tunnelList`: per-key `ready/open/Open/×`. `Open` opens `/?target=key`.
+- Dead tunnel removed immediately: `dc.onclose/ws.onclose/pc failed/ping fail>=3` → `tunnels.delete + clearTunnel + renderTunnelList`. Background `prune 5s` + `probe 6s` purges stale `localStorage`.
+
+SW (`p2p-sw.js`):
+
+- Per-key `readyHostByTarget Map<key,hostId>`, `targetByClient`, `readyByClient`.
+- `fetch` resolves `?target → targetByClient → Referer ?target → client.url ?target → single-live fallback`.
+- Not ready: wait `20*150ms`, then `503 Tunnel not ready … open /p2p/?target=… and click Connect`. No auto `302` to `/p2p/?next=`.
 
 ## Project layout
 
 ```
 p2p-gateway/
-├── cmd/gateway/      # entry point, HTTP server wiring
+├── cmd/gateway/      # entry point, HTTP wiring
 ├── internal/
 │   ├── routing/      # host prefix → upstream URL
-│   ├── signaling/    # gorilla/websocket-based offer/answer relay
+│   ├── signaling/    # gorilla/websocket offer/answer relay
 │   ├── webrtc/       # pion/webrtc PeerConnection lifecycle
-│   └── proxy/        # JSON-over-DataChannel HTTP request handler
-├── web/files/        # index.html, client.js, p2p-sw.js (embedded)
-├── go.mod
-├── go.sum
+│   └── proxy/        # JSON-over-DataChannel HTTP forwarder (per-request Target)
+├── web/files/        # index.html, client.js, p2p-sw.js (embedded + disk)
 ├── config.yaml       # runtime configuration
+├── restart.sh        # vet + syntax + build + restart + LISTEN check
 └── README.md
 ```
 
 ## Prerequisites
 
 * Go 1.21+
-* A registered DNS name you control (e.g. `example.com`)
-* A TLS certificate covering `p2p-<anything>.example.com`
-* A STUN server (the default config uses Google's public STUN, which
-  works for NAT-traversal in most cases)
+* STUN server (default `stun:stun.miwifi.com:3478`), optional TURN
+* Chrome/Firefox with WebRTC + ServiceWorker
 
-## Build
+## Build & Run
 
 ```bash
-go mod tidy
-go build -o p2p-gateway ./cmd/gateway
+go vet ./...
+node --check web/files/client.js && node --check web/files/p2p-sw.js
+go build -o /tmp/p2p-gateway-bin ./cmd/gateway
 ```
 
-The result is a single static binary `p2p-gateway`.
-
-## Configuration
-
-Edit `config.yaml`:
-
-```yaml
-listen_addr: ":443"
-tls_cert: "/etc/ssl/fullchain.pem"
-tls_key: "/etc/ssl/privkey.pem"
-base_domain: "example.com"
-prefix: "p2p-"
-stun_url: "stun:stun.l.google.com:19302"
-```
-
-* `listen_addr` - `:443` for production. Anything works for testing.
-* `tls_cert` / `tls_key` - PEM-encoded certificate + private key. The
-  certificate must include `p2p-<x>.example.com` in the SAN list (or be
-  a wildcard for `*.example.com`).
-* `base_domain` - the apex domain that hosts the gateway. Subdomains of
-  this domain matching `prefix*` are mapped to upstream URLs.
-* `prefix` - the subdomain prefix that triggers the tunnel. The default
-  `p2p-` maps `p2p-a.example.com` → `https://a.example.com`.
-* `stun_url` - a STUN URI the browser will use for ICE. Google and
-  Cloudflare both provide free public servers.
-
-Optional fields:
-
-* `scheme: "http"` - talk to upstreams over plain HTTP. **Do not** use in
-  production; only for local development.
-* `upstream_port: 8000` - append a fixed port to every upstream URL.
-  Useful when testing against a local server on a non-default port.
-
-### Host → upstream mapping
-
-Given `base_domain: example.com` and `prefix: p2p-`:
-
-| Gateway host           | Upstream                  |
-|------------------------|---------------------------|
-| `p2p-a.example.com`    | `https://a.example.com`   |
-| `p2p-b.example.com`    | `https://b.example.com`   |
-| `p2p-api.example.com`  | `https://api.example.com` |
-| `p2p-foo.bar.example.com` | `https://foo.bar.example.com` |
-
-Hosts without the prefix (`example.com`, `other.com`) are rejected with
-`400 Bad Request`.
-
-## DNS setup
-
-For each upstream you want to expose, create a DNS A/AAAA record
-pointing the `p2p-<name>` subdomain at the gateway server:
-
-```text
-p2p-a   IN  A     <gateway.ip>
-p2p-b   IN  A     <gateway.ip>
-p2p-api IN  CNAME p2p-a.example.com.
-```
-
-You can also use a wildcard:
-
-```text
-*.p2p-  IN  A     <gateway.ip>
-```
-
-This single record covers every gateway host.
-
-## TLS setup
-
-Use any ACME client (certbot, acme.sh, Caddy) to obtain a certificate
-that covers the gateway hostnames. For testing:
+One-key (same as above + restart + check):
 
 ```bash
-openssl req -x509 -newkey rsa:2048 \
-  -keyout ./certs/privkey.pem \
-  -out    ./certs/fullchain.pem \
-  -days 365 -nodes \
-  -subj "/CN=p2p-a.example.com" \
-  -addext "subjectAltName=DNS:p2p-a.example.com,DNS:p2p-b.example.com,DNS:*.example.com"
+bash restart.sh
+# BUILD_OK 15M / LISTEN_OK :62057 / 200
 ```
 
-The gateway speaks **plain TLS 1.2+**; HTTP/2 is allowed but
-unimportant because the only long-lived connections are WebSockets
-(forced to HTTP/1.1 by the browser for the signaling endpoint, then
-upgraded in place).
-
-## Run
+Or:
 
 ```bash
 ./p2p-gateway                # uses ./config.yaml
 ./p2p-gateway /etc/p2p.yaml  # explicit config path
-```
-
-The gateway logs the resolved configuration and the listen address on
-startup. SIGINT / SIGTERM trigger a graceful shutdown.
-
-### Development with `go run`
-
-You don't need to build for development:
-
-```bash
 go run ./cmd/gateway ./config.yaml
 ```
 
+## Configuration
+
+`config.yaml`:
+
+```yaml
+listen_addr: ":62057"
+base_domain: "localhost"
+prefix: "p2p-"
+stun_url: "stun:stun.miwifi.com:3478"
+turn_url: "turn:user:pass@host:3478?transport=udp"
+scheme: "http"
+```
+
+* `listen_addr` - e.g. `:62057`
+* `stun_url` / `turn_url` - ICE servers
+* `scheme` - default upstream scheme for host routing
+* `--target <url>` or `target:` - fixed upstream (overrides `?target=`? No: `?target=` wins per-peer)
+
+Signaling target priority: `?target=` > global `Target` > host direct/prefix routing.
+
 ## Browser test
 
-1. Open `https://p2p-a.example.com/` in Chrome or Firefox.
-2. The page shows a status panel:
+1. Open `http://127.0.0.1:62057/p2p/?target=http://127.0.0.1:3000`.
+2. Click **Connect** → spinner → log `DC open` → auto reuses placeholder tab to `/?target=<key>`.
+3. Click **Fetch / via tunnel** → `HTTP 200`.
+4. Second target e.g. `http://192.168.1.5:8080` → Connect again, tunnels coexist, assets route per-key.
+5. Direct open `/?target=<key>` with no tunnel → `503`, no auto redirect.
+6. Kill upstream / close DC → entry disappears from list within seconds.
 
-   ```
-   Target         https://a.example.com
-   Gateway Host   p2p-a.example.com
-   Service Worker OK
-   Signaling      OK
-   STUN           stun:stun.l.google.com:19302
-   ICE            connected
-   DataChannel    OPEN
-   Status         Connected
-   ```
+Cache bust: files versioned (`/client.js?v=v22…`, `/p2p/sw.js?v=v22…`) + `no-cache,no-store` headers. If UI stale (`e.state.includes is not a function` or old behavior): hard refresh `Ctrl+Shift+R`, DevTools → Application → Service Workers → Unregister → Reload.
 
-3. Click **Fetch / via P2P tunnel**. The request goes:
+## Wire protocol (v2 + Target)
 
-   ```
-   browser
-   → Service Worker (intercept)
-   → WebRTC DataChannel "http"
-   → Go gateway (this binary)
-   → HTTPS upstream (https://a.example.com)
-   ```
-
-   The response flows back the same way. The browser URL bar never
-   changes.
-
-4. Try `p2p-b.example.com/` - it should serve `b.example.com`'s content
-   through a separate browser session, proving that one binary can host
-   many tunnels at once.
-
-### How the data flows
-
-```
-┌────────────────────────────────┐
-│  index.html  ──  registers ──  │  Service Worker (p2p-sw.js)
-│                                │      ▲
-│  client.js  ──  opens WS  ──► Gateway WebSocket /_signal
-│  client.js  ──  offers   ──► pion/webrtc PeerConnection
-│                                │      ▲
-│  client.js  ──  sends    ──► DataChannel "http"
-│                                │      ▲
-└────────────────────────────────┘
-                               gateway
-                                │
-                                ▼
-                       ┌─────────────────┐
-                       │  JSON frames    │
-                       │  ── request     │  proxy.Forward → http.Client
-                       │  ── response    │  ← resp body
-                       └─────────────────┘
-```
-
-### Wire protocol (v1)
-
-Request frame (browser → gateway):
+Request (browser → gateway), `target` = normalized key:
 
 ```json
-{
-  "type": "request",
-  "id": "abc123",
-  "method": "GET",
-  "path": "/foo?x=1",
-  "headers": { "accept": "text/html", "cookie": "..." },
-  "body": "<base64 of body bytes>"
-}
+{"type":"request","id":"abc","method":"GET","path":"/?x=1","headers":{},"body":"<b64>","target":"http://127.0.0.1:3000"}
 ```
 
-Response frame (gateway → browser):
+Response / chunked (gateway → browser):
 
 ```json
-{
-  "type": "response",
-  "id": "abc123",
-  "status": 200,
-  "headers": { "content-type": "text/html" },
-  "body": "<base64 of body bytes>"
-}
+{"type":"response","id":"abc","status":200,"headers":{},"body":"<b64>"}
+{"type":"response-start","id":"abc","status":200,"headers":{},"chunks":N}
+{"type":"response-chunk","id":"abc","idx":0,"data":"<b64>"}
+{"type":"response-end","id":"abc"}
 ```
 
-Bodies are base64 because DataChannel text messages must be valid UTF-8.
-Bodies are sent only when non-empty.
+Control: `ws-open/ws-data/ws-closed`, `ping/pong`, `ready/ready-ack`. Client timeout `8s`, SW tunnel timeout `8-10s`.
 
-## Fallback
-
-If the WebRTC connection drops (or never establishes), the Service
-Worker rewrites each `fetch()` to `https://<gateway>/upstream/<path>`
-and lets the browser hit the gateway's reverse-proxy handler. That
-handler talks directly to the upstream, so the page keeps working -
-just without the P2P indirection.
-
-The `/upstream/` prefix is also useful for non-browser clients (e.g.
-`curl`) that don't run Service Workers.
-
-## What is *not* implemented
-
-Per the v1 spec, this version deliberately omits:
-
-* Docker / Kubernetes packaging
-* Redis / database persistence
-* User authentication
-* WebSocket proxying
-* HTTP/2 / HTTP/3 tunnels
-* Caching, CDN integration
-* HTML / JavaScript rewriting (the browser sees the upstream's raw
-  markup)
-* Per-host permissions / multi-tenant UI
-* TURN servers (works only if both sides can reach each other directly
-  via STUN-derived candidates; for restrictive NATs you will need to
-  add a TURN URL to the `iceServers` list in `client.js`)
-
-## Files
-
-* `cmd/gateway/main.go` - HTTP server, config loading, fallback proxy
-* `internal/routing/routing.go` - `p2p-a.example.com` → `https://a.example.com`
-* `internal/signaling/hub.go` - WebSocket room, peer addressing
-* `internal/webrtc/peer.go` - pion PeerConnection lifecycle
-* `internal/proxy/proxy.go` - JSON-over-DataChannel HTTP forwarder
-* `web/files/index.html` - the bootstrap page
-* `web/files/client.js` - registers the SW, opens WS, runs WebRTC
-* `web/files/p2p-sw.js` - Service Worker that tunnels fetch()
-* `config.yaml` - runtime configuration
+Fallback `/upstream/` is disabled (`503 P2P-only mode`). Non-browser clients must use WebRTC path.
 
 ## Testing
 
 ```bash
 go test ./...
+go vet ./...
 ```
 
-Currently covers:
-
-* `internal/routing` - host prefix parsing
-* `internal/proxy` - GET/POST forward, header handling, error envelopes
+Covers `internal/routing`, `internal/proxy`.
 
 ## Troubleshooting
 
-| Symptom | Likely cause |
-|---------|--------------|
-| Page shows "Status: Connecting" forever | Signaling WS failed - check that the gateway is reachable, TLS cert covers the host. |
-| `ICE: failed` | Both sides are behind symmetric NAT. Add a TURN server. |
-| `DataChannel: CLOSED` | The gateway PeerConnection closed prematurely. Check gateway logs for `[webrtc]` errors. |
-| Requests hang in the SW | The DataChannel message timed out. Look at `[webrtc] handler error` lines. |
-| `bad host` from `/upstream/` | The Host header does not start with `prefix-` or does not match `base_domain`. |
-| `dial tcp: i/o timeout` to upstream | The upstream host is unreachable. The gateway uses Go's default `http.Client`; check DNS / routing. |
+| Symptom | Cause / fix |
+|---------|-------------|
+| `e.state.includes is not a function` / old UI | Stale `client.js`/SW cache → hard refresh + Unregister SW, check `?v=` version |
+| `503 Tunnel not ready` | No DC for key → keep `/p2p/?target=` open, click Connect, keep tab alive |
+| `Status: Connecting` forever | Signaling WS failed → check listen port, `config.yaml`, gateway log |
+| `ICE failed` | Symmetric NAT → add TURN |
+| `DC CLOSED` / list entry vanishes | Upstream/peer gone, ping `fail>=3`, owner keeper expired → reconnect |
+| `no tunnel for target` in log | SW demux strict per-key, no cross-routing → open `/p2p/?target=<key>` and Connect |
+| Popup blocked | Allow popups, or manually open `/?target=<key>`; keep `/p2p/` tab open |
 
-Enable verbose logging by setting `LOG_LEVEL=debug` (currently the
-gateway uses the standard `log` package; in production, pipe through
-`journalctl` or any structured log shipper).
+## Files
+
+* `cmd/gateway/main.go` - HTTP server, `/p2p/*` + `/` wiring, no-cache headers
+* `internal/signaling/hub.go` - WS room
+* `internal/webrtc/peer.go` - pion lifecycle, `SetTarget`
+* `internal/proxy/proxy.go` - `Request/WSOpen {Target}`, `forwardHTTP` per `effTarget`
+* `web/files/index.html` - UI + spinner CSS
+* `web/files/client.js` - tunnels Map, `ensureTunnel/buildTunnel/switchTarget/openTargetTab`, prune/probe
+* `web/files/p2p-sw.js` - per-key `readyHostByTarget`, `forward/wsTunnel`, 503 path
+* `restart.sh` - one-key verify
 
 ## Acknowledgements
 
-Architecture inspired by:
-
-* [`andrewmthomas87/web-p2p-tunnel`](https://github.com/andrewmthomas87/web-p2p-tunnel) - Service Worker + WebRTC DataChannel + Go reverse proxy.
-* [`ambianic/peerfetch`](https://github.com/ambianic/peerfetch) - HTTP over WebRTC DataChannel.
-
-No code was copied from either project.
+* [`andrewmthomas87/web-p2p-tunnel`](https://github.com/andrewmthomas87/web-p2p-tunnel)
+* [`ambianic/peerfetch`](https://github.com/ambianic/peerfetch)
