@@ -23,6 +23,7 @@ type Peer struct {
 	inbox      chan []byte
 	wsStreams  map[string]*websocket.Conn
 	mu         sync.Mutex
+	sendMu     sync.Mutex
 	closed     bool
 	target     string
 }
@@ -244,6 +245,8 @@ func (p *Peer) Close() {
 func (p *Peer) DataChannel() *webrtc.DataChannel { return p.dc }
 
 func (p *Peer) SendDC(data []byte) {
+	p.sendMu.Lock()
+	defer p.sendMu.Unlock()
 	p.mu.Lock()
 	dc := p.dc
 	p.mu.Unlock()
@@ -301,13 +304,16 @@ func (p *Peer) handleDCMessage(msg webrtc.DataChannelMessage) {
 		return
 	case "request":
 		if p.onReq != nil {
-			resp, err := p.onReq(p, raw)
-			if err != nil {
-				log.Printf("[proxy] handler error: %v", err)
-			}
-			if resp != nil {
-				p.SendDC(resp)
-			}
+			rawCopy := append([]byte(nil), raw...)
+			go func() {
+				resp, err := p.onReq(p, rawCopy)
+				if err != nil {
+					log.Printf("[proxy] handler error: %v", err)
+				}
+				if resp != nil {
+					p.SendDC(resp)
+				}
+			}()
 		}
 	case "ws-open":
 		p.handleWSOpen(raw, envelope.StreamID)
@@ -317,13 +323,16 @@ func (p *Peer) handleDCMessage(msg webrtc.DataChannelMessage) {
 		p.handleWSClose(envelope.StreamID)
 	default:
 		if p.onReq != nil {
-			resp, err := p.onReq(p, raw)
-			if err != nil {
-				log.Printf("[proxy] handler error: %v", err)
-			}
-			if resp != nil {
-				p.SendDC(resp)
-			}
+			rawCopy := append([]byte(nil), raw...)
+			go func() {
+				resp, err := p.onReq(p, rawCopy)
+				if err != nil {
+					log.Printf("[proxy] handler error: %v", err)
+				}
+				if resp != nil {
+					p.SendDC(resp)
+				}
+			}()
 		}
 	}
 }

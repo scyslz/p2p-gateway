@@ -1,5 +1,5 @@
 'use strict';
-const SW_VER='v22-fix-includes';
+const SW_VER='v23-noblock';
 function normalizeTarget(raw){
     if(!raw) return '';
     raw=String(raw).trim(); if(!raw) return '';
@@ -304,7 +304,7 @@ function p2pFetch(req, clientId, effectiveTarget) {
     return new Promise((resolve, reject)=>{
         const id=nextID();
         const ch=new MessageChannel();
-        const timer=setTimeout(()=>{ ch.port1.close(); reject(new Error('tunnel timeout 8s id='+id)); },8000);
+        const timer=setTimeout(()=>{ ch.port1.close(); reject(new Error('tunnel timeout 30s id='+id)); },30000);
         ch.port1.onmessage=(event)=>{
             const msg=event.data||{};
             if(msg.type==='response'){ clearTimeout(timer); ch.port1.close(); resolve(buildResponse(msg)); }

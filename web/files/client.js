@@ -326,7 +326,7 @@
         el.textContent = text;
         el.className = ok ? 'val ok' : (ok === false ? 'val bad' : 'val');
     }
-    const SW_VERSION = 'v22-fix-includes';
+    const SW_VERSION = 'v23-noblock';
     const DIAG = (lvl, tag, msg) => { try { L(lvl, tag, msg); } catch(e) {} try { console.log('['+tag+'] '+msg); } catch(e) {} };
     const tunnels = new Map();
     let booted = false;
@@ -343,7 +343,7 @@
     }
     if ('serviceWorker' in navigator) {
         L('info', 'SW', 'Registering service worker…');
-        navigator.serviceWorker.register('/p2p/sw.js?v=v22-fix-includes', { scope: '/' })
+        navigator.serviceWorker.register('/p2p/sw.js?v=v23-noblock', { scope: '/' })
             .then(reg => {
                 if (reg.waiting) { L('warn', 'SW', 'New SW waiting, activating…'); reg.waiting.postMessage({ type: 'skip-waiting' }); }
                 reg.addEventListener('updatefound', () => {
@@ -670,7 +670,7 @@
                         if(!ent.dc || ent.dc.readyState!=='open'){ port.postMessage({ type:'error', error:'dc not open' }); return; }
                         ent.inflight.set(msg.payload.id, port);
                         try{ ent.dc.send(JSON.stringify(msg.payload)); }catch(e){ port.postMessage({type:'error',error:e.message}); ent.inflight.delete(msg.payload.id); return; }
-                        setTimeout(()=>{ if(ent.inflight.has(msg.payload.id)){ const p=ent.inflight.get(msg.payload.id); ent.inflight.delete(msg.payload.id); try{p.postMessage({type:'error',error:'client timeout 8s'});}catch(_){} }},8000);
+                        setTimeout(()=>{ if(ent.inflight.has(msg.payload.id)){ const p=ent.inflight.get(msg.payload.id); ent.inflight.delete(msg.payload.id); try{p.postMessage({type:'error',error:'client timeout 30s'});}catch(_){} }},30000);
                     } else if(msg.type==='ws-tunnel' && msg.payload){
                         if(!ent.dc || ent.dc.readyState!=='open'){ port.postMessage({type:'error',error:'dc not open'}); return; }
                         ent.wsStreams.set(msg.payload.id, port); try{ ent.dc.send(JSON.stringify(msg.payload)); }catch(e){ port.postMessage({type:'error',error:e.message}); }

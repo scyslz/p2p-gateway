@@ -510,11 +510,20 @@ func errorResponse(id string, status int, msg string) *Response {
 
 var testClientOverride *http.Client
 
+var sharedClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 func testClient() *http.Client {
 	if testClientOverride != nil {
 		return testClientOverride
 	}
-	return &http.Client{Timeout: 30 * time.Second}
+	return sharedClient
 }
 
 func SetTestClient(c *http.Client) { testClientOverride = c }
